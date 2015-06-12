@@ -73,7 +73,6 @@ exportdir::
 	$(INSTALL) $(INSTALLDIROPT) $(TOPDIR)/$(EXPORTDIR)/tests/eri
 	-$(INSTALL) $(INSTALLLIBOPT) $(SRCTOPDIR)/tests/eri/test.cc $(TOPDIR)/$(EXPORTDIR)/tests/eri/test.cc
 	-$(INSTALL) $(INSTALLLIBOPT) $(SRCTOPDIR)/src/bin/test_eri/eri.h $(TOPDIR)/$(EXPORTDIR)/tests/eri/eri.h
-	-$(INSTALL) $(INSTALLLIBOPT) $(SRCTOPDIR)/src/bin/test_eri/eri.cc $(TOPDIR)/$(EXPORTDIR)/tests/eri/eri.cc
 	-$(INSTALL) $(INSTALLLIBOPT) $(SRCTOPDIR)/src/bin/test_eri/prep_libint2.h $(TOPDIR)/$(EXPORTDIR)/tests/eri/prep_libint2.h
 	-$(INSTALL) $(INSTALLLIBOPT) $(SRCTOPDIR)/src/bin/libint/deriv_iter.h $(TOPDIR)/$(EXPORTDIR)/tests/eri/deriv_iter.h
 	$(INSTALL) $(INSTALLDIROPT) $(TOPDIR)/$(EXPORTDIR)/tests/hartree-fock
@@ -88,5 +87,7 @@ exportdir::
 	-$(INSTALL) $(INSTALLLIBOPT) $(SRCTOPDIR)/doc/Libint_Logo3_alt.pdf $(TOPDIR)/$(EXPORTDIR)/doc/Libint_Logo3_alt.pdf
 	-$(INSTALL) $(INSTALLLIBOPT) $(SRCTOPDIR)/doc/Libint_Logo3_alt.eps $(TOPDIR)/$(EXPORTDIR)/doc/Libint_Logo3_alt.eps
 	-$(INSTALL) $(INSTALLLIBOPT) $(SRCDIR)/Makefile.doc.export $(TOPDIR)/$(EXPORTDIR)/doc/Makefile.in
+	$(INSTALL) $(INSTALLDIROPT) $(TOPDIR)/$(EXPORTDIR)/external
+	-$(INSTALL) $(INSTALLLIBOPT) $(SRCTOPDIR)/external/boost.tar.gz $(TOPDIR)/$(EXPORTDIR)/external/boost.tar.gz
 	$(TOPOBJDIR)/config.status --config > $(TOPDIR)/$(EXPORTDIR)/compiler.config
 

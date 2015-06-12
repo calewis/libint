@@ -55,7 +55,7 @@ size_t nbasis(const std::vector<Shell>& shells);
 std::vector<size_t> map_shell_to_basis_function(const std::vector<Shell>& shells);
 Matrix compute_soad(const std::vector<Atom>& atoms);
 Matrix compute_1body_ints(const std::vector<libint2::Shell>& shells,
-                          libint2::OneBodyEngine::integral_type t,
+                          libint2::OneBodyEngine::operator_type t,
                           const std::vector<Atom>& atoms = std::vector<Atom>());
 
 // simple-to-read, but inefficient Fock builder; computes ~16 times as many ints as possible
@@ -254,9 +254,14 @@ int main(int argc, char *argv[]) {
 
 // this reads the geometry in the standard xyz format supported by most chemistry software
 std::vector<Atom> read_dotxyz(std::istream& is) {
+  // line 1 = # of atoms
   size_t natom;
   is >> natom;
+  // read off the rest of line 1 and discard
+  std::string rest_of_line;
+  std::getline(is, rest_of_line);
 
+  // line 2 = comment (possibly empty)
   std::string comment;
   std::getline(is, comment);
 
@@ -440,11 +445,6 @@ std::vector<Shell> make_sto3g_basis(const std::vector<Atom>& atoms) {
 
   }
 
-  // technical step: rescale contraction coefficients to include primitive normalization coefficients
-  for(auto& s: shells) {
-    s.renorm();
-  }
-
   return shells;
 }
 
@@ -523,7 +523,7 @@ Matrix compute_soad(const std::vector<Atom>& atoms) {
 }
 
 Matrix compute_1body_ints(const std::vector<libint2::Shell>& shells,
-                          libint2::OneBodyEngine::integral_type obtype,
+                          libint2::OneBodyEngine::operator_type obtype,
                           const std::vector<Atom>& atoms)
 {
   const auto n = nbasis(shells);
@@ -538,7 +538,7 @@ Matrix compute_1body_ints(const std::vector<libint2::Shell>& shells,
     for(const auto& atom : atoms) {
       q.push_back( {static_cast<double>(atom.atomic_number), {{atom.x, atom.y, atom.z}}} );
     }
-    engine.set_q(q);
+    engine.set_params(q);
   }
 
   auto shell2bf = map_shell_to_basis_function(shells);
