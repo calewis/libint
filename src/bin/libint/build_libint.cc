@@ -249,11 +249,13 @@ namespace {
   }
 }
 
-template <typename OperType>
+template <typename _OperType>
 void
 build_onebody_1b_1k(std::ostream& os, std::string label, const SafePtr<CompilationParameters>& cparams,
                     SafePtr<Libint2Iface>& iface, unsigned int deriv_level)
 {
+  // implement overlap as a special case of cartesian emultipole
+  using OperType = typename std::conditional<std::is_same<_OperType,OverlapOper>::value,CartesianMultipoleOper<3u>,_OperType>::type;
   const std::string task = task_label(label, deriv_level);
   const std::string task_uc = task_label(label, deriv_level);
   typedef CGShell BFType;
@@ -293,8 +295,8 @@ build_onebody_1b_1k(std::ostream& os, std::string label, const SafePtr<Compilati
 
           // skip s|s overlap and elecpot integrals -- no need to involve LIBINT here
           if (deriv_level == 0 && la == 0 && lb == 0 &&
-              (std::is_same<OperSet,OverlapOper>::value ||
-               std::is_same<OperSet,ElecPotOper>::value)
+              (std::is_same<_OperType,OverlapOper>::value || std::is_same<_OperType,ElecPotOper>::value
+              )
              )
             continue;
 
@@ -320,18 +322,20 @@ build_onebody_1b_1k(std::ostream& os, std::string label, const SafePtr<Compilati
           // most important operators have 1 component ...
           std::vector<OperDescrType> descrs(1); // operator descriptors
           // important EXCEPTION: multipole moments
-          if (std::is_same<OperType,CartesianMultipoleOper<3u>>::value) {
+          if (std::is_same<_OperType,CartesianMultipoleOper<3u>>::value) {
             // reset descriptors array
             descrs.resize(0);
 
             // parse the label ... 1emultipole means include multipoles of order 0 (overlap) and 1 (dipole)
             unsigned int max_multipole_order = 0;
+            assert(label != "overlap");
             auto key_pos = label.find("emultipole");
             assert(key_pos != std::string::npos);
             std::string tmp = label; tmp.erase(key_pos,std::string::npos);
             istringstream iss(tmp);
             iss >> max_multipole_order;
             assert(max_multipole_order > 0);
+
             // iterate over operators and construct their descriptors
             for(int multipole_order=0; multipole_order<=max_multipole_order; ++multipole_order) {
               // we iterate over them same way as over cartesian Gaussian shells
@@ -342,42 +346,49 @@ build_onebody_1b_1k(std::ostream& os, std::string label, const SafePtr<Compilati
             }
           }
 
-          for(unsigned int op=0; op!=descrs.size(); ++op) {
+          // derivative index is the outermost (slowest running)
+          // operator component is second slowest
 
-            OperType oper(descrs[op]);
-
-            ////////////
-            // loop over unique derivative index combinations
-            ////////////
-            // skip 1 center -- all derivatives with respect to that center can be
-            // recovered using translational invariance conditions
-            // which center to skip? -> A = 0, B = 1
-            const unsigned int center_to_skip = 1;
-            DerivIndexIterator<1> diter(deriv_level);
-            bool last_deriv = false;
-            do {
-              BFType a(la);
-              BFType b(lb);
-
-              unsigned int center = 0;
-              for(unsigned int i=0; i<2; ++i) {
-                if (i == center_to_skip)
-                  continue;
-                const unsigned int ndir = std::is_same<BFType,CGShell>::value ? 3 : 1;
-                for(unsigned int xyz=0; xyz<ndir; ++xyz) {
-                  if (i == 0) a.deriv().inc(xyz, diter.value(3 * center + xyz));
-                  if (i == 1) b.deriv().inc(xyz, diter.value(3 * center + xyz));
-                }
-                ++center;
+          ////////////
+          // loop over unique derivative index combinations
+          ////////////
+          // skip 1 center -- all derivatives with respect to that center can be
+          // recovered using translational invariance conditions
+          // which center to skip? (A = 0, B = 1, C = 2)
+          // case1: operator is coordinate-independent (overlap, kinetic) -> B
+          // case2: operator is coordinate-dependent (elecpot, emultipole) -> C
+          constexpr bool coordinate_independent_oper = std::is_same<_OperType,OverlapOper>::value ||
+                                                       std::is_same<_OperType,KineticOper>::value;
+          constexpr unsigned int center_to_skip = (coordinate_independent_oper) ? 1 : 2;
+          constexpr unsigned int num_deriv_centers = (coordinate_independent_oper) ? 2 : 3;
+          DerivIndexIterator<num_deriv_centers - 1> diter(deriv_level);
+          bool last_deriv = false;
+          do {
+            BFType a(la);
+            BFType b(lb);
+            
+            for(unsigned int c=0, center=0; c<num_deriv_centers; ++c) {
+              if (c == center_to_skip)
+                continue;
+              const unsigned int ndir = std::is_same<BFType,CGShell>::value ? 3 : 1;
+              for(unsigned int xyz=0; xyz<ndir; ++xyz) {
+                if (c == 0) a.deriv().inc(xyz, diter.value(3 * center + xyz));
+                if (c == 1) b.deriv().inc(xyz, diter.value(3 * center + xyz));
               }
+              ++center;
+            }
+
+            // operator component loop
+            for(unsigned int op=0; op!=descrs.size(); ++op) {
+              OperType oper(descrs[op]);
 
               SafePtr<Onebody_sh_1_1> target = Onebody_sh_1_1::Instance(a,b,nullaux,oper);
               targets.push_back(target);
-              last_deriv = diter.last();
-              if (!last_deriv) diter.next();
-            } while (!last_deriv); // loop over derivatives
-
-          } // loop over operator components
+            } // loop over operator components
+            
+            last_deriv = diter.last();
+            if (!last_deriv) diter.next();
+          } while (!last_deriv); // loop over derivatives
 
           // shove all targets on the graph, IN ORDER
           for(auto t = targets.begin(); t!=targets.end(); ++t) {
@@ -398,7 +409,7 @@ build_onebody_1b_1k(std::ostream& os, std::string label, const SafePtr<Compilati
             eval_label = oss.str();
           }
 
-          std::cout << "working on " << eval_label << " ... ";
+          std::cout << "working on " << eval_label << " ... "; std::cout.flush();
 
           std::string prefix(cparams->source_directory());
           std::deque<std::string> decl_filenames;
@@ -998,7 +1009,7 @@ build_TwoPRep_2b_2k(std::ostream& os, const SafePtr<CompilationParameters>& cpar
             label += abcd_label;
           }
 
-          std::cout << "working on " << label << " ... ";
+          std::cout << "working on " << label << " ... "; std::cout.flush();
 
           std::string prefix(cparams->source_directory());
           std::deque<std::string> decl_filenames;

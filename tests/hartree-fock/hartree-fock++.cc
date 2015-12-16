@@ -17,10 +17,6 @@
  *
  */
 
-#if __cplusplus <= 199711L
-# error "Hartree-Fock test requires C++11 support"
-#endif
-
 // standard C++ headers
 #include <cmath>
 #include <iostream>
@@ -32,6 +28,8 @@
 #include <thread>
 #include <atomic>
 #include <iterator>
+#include <unordered_map>
+#include <mutex>
 
 // Eigen matrix algebra library
 #include <Eigen/Dense>
@@ -59,6 +57,8 @@ typedef Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>
         Matrix;  // import dense, dynamically sized Matrix type from Eigen;
                  // this is a matrix with row-major storage (http://en.wikipedia.org/wiki/Row-major_order)
                  // to meet the layout of the integrals returned by the Libint integral library
+typedef Eigen::DiagonalMatrix<double, Eigen::Dynamic, Eigen::Dynamic>
+        DiagonalMatrix;
 
 using libint2::Shell;
 using libint2::Atom;
@@ -74,7 +74,35 @@ template <libint2::OneBodyEngine::operator_type obtype>
 std::array<Matrix, libint2::OneBodyEngine::operator_traits<obtype>::nopers>
 compute_1body_ints(const BasisSet& obs,
                    const std::vector<Atom>& atoms = std::vector<Atom>());
-Matrix compute_schwartz_ints(const BasisSet& obs);
+
+#if LIBINT2_DERIV_ONEBODY_ORDER
+template <libint2::OneBodyEngine::operator_type obtype>
+std::vector<Matrix>
+compute_1body_deriv_ints(unsigned deriv_order,
+                         const BasisSet& obs,
+                         const std::vector<Atom>& atoms);
+#endif
+
+Matrix compute_schwartz_ints(const BasisSet& bs1,
+                             const BasisSet& bs2 = BasisSet(),
+                             bool use_2norm = false // use infty norm by default
+                            );
+Matrix compute_do_ints(const BasisSet& bs1,
+                       const BasisSet& bs2 = BasisSet(),
+                       bool use_2norm = false // use infty norm by default
+                      );
+
+using shellpair_list_t = std::unordered_map<size_t,std::vector<size_t>>;
+shellpair_list_t obs_shellpair_list; // shellpair list for OBS
+
+/// computes non-negligible shell pair list; shells \c i and \c j form a non-negligible
+/// pair if they share a center or the Frobenius norm of their overlap is greater than threshold
+shellpair_list_t
+compute_shellpair_list(const BasisSet& bs1,
+                       const BasisSet& bs2 = BasisSet(),
+                       double threshold = 1e-12
+                      );
+
 Matrix compute_2body_fock(const BasisSet& obs,
                           const Matrix& D,
                           double precision = std::numeric_limits<double>::epsilon(), // discard contributions smaller than this
@@ -89,14 +117,50 @@ Matrix compute_2body_fock_general(const BasisSet& obs,
                                  );
 
 #ifdef LIBINT2_HAVE_BTAS
-// a DF-based builder, using coefficients of occupied MOs
-Matrix compute_2body_fock_dfC(const BasisSet& obs,
-                              const BasisSet& dfbs,
-                              const Matrix& Cocc);
-#endif // LIBINT2_HAVE_BTAS
+# define HAVE_DENSITY_FITTING 1
+  struct DFFockEngine {
+    const BasisSet& obs;
+    const BasisSet& dfbs;
+    DFFockEngine(const BasisSet& _obs, const BasisSet& _dfbs) :
+      obs(_obs), dfbs(_dfbs)
+    {
+    }
+
+    typedef btas::RangeNd<CblasRowMajor, std::array<long, 3> > Range3d;
+    typedef btas::Tensor<double, Range3d> Tensor3d;
+    Tensor3d xyK;
+
+    // a DF-based builder, using coefficients of occupied MOs
+    Matrix compute_2body_fock_dfC(const Matrix& Cocc);
+  };
+#endif // HAVE_DENSITY_FITTING
 
 namespace libint2 {
   int nthreads;
+
+  /// fires off \c nthreads instances of lambda in parallel
+  template <typename Lambda>
+  void parallel_do(Lambda& lambda) {
+#ifdef _OPENMP
+  #pragma omp parallel
+  {
+    auto thread_id = omp_get_thread_num();
+    lambda(thread_id);
+  }
+#else // use C++11 threads
+  std::vector<std::thread> threads;
+  for(int thread_id=0; thread_id != libint2::nthreads; ++thread_id) {
+    if(thread_id != nthreads-1)
+      threads.push_back(std::thread(lambda,
+                                    thread_id));
+    else
+      lambda(thread_id);
+  } // threads_id
+  for(int thread_id=0; thread_id<nthreads-1; ++thread_id)
+    threads[thread_id].join();
+#endif
+  }
+
 }
 
 int main(int argc, char *argv[]) {
@@ -114,6 +178,11 @@ int main(int argc, char *argv[]) {
     // read geometry from a file; by default read from h2o.xyz, else take filename (.xyz) from the command line
     const auto filename = (argc > 1) ? argv[1] : "h2o.xyz";
     const auto basisname = (argc > 2) ? argv[2] : "aug-cc-pVDZ";
+    bool do_density_fitting = false;
+#ifdef HAVE_DENSITY_FITTING
+    do_density_fitting = (argc > 3);
+    const auto dfbasisname = do_density_fitting ? argv[3] : "";
+#endif
     std::vector<Atom> atoms = read_geometry(filename);
 
     // set up thread pool
@@ -144,6 +213,7 @@ int main(int argc, char *argv[]) {
     for (auto i = 0; i < atoms.size(); ++i)
       nelectron += atoms[i].atomic_number;
     const auto ndocc = nelectron / 2;
+    cout << "# of electrons = " << nelectron << endl;
 
     // compute the nuclear repulsion energy
     auto enuc = 0.0;
@@ -160,10 +230,22 @@ int main(int argc, char *argv[]) {
 
     libint2::Shell::do_enforce_unit_normalization(false);
 
-    BasisSet obs(basisname, atoms);
+    cout << "Atomic Cartesian coordinates (a.u.):" << endl;
     for(const auto& a: atoms)
       std::cout << a.atomic_number << " " << a.x << " " << a.y << " " << a.z << std::endl;
-    cout << "basis rank = " << obs.nbf() << endl;
+
+    BasisSet obs(basisname, atoms);
+    cout << "orbital basis set rank = " << obs.nbf() << endl;
+
+#ifdef HAVE_DENSITY_FITTING
+    BasisSet dfbs;
+    if (do_density_fitting) {
+      dfbs = BasisSet(dfbasisname, atoms);
+      cout << "density-fitting basis set rank = " << dfbs.nbf() << endl;
+    }
+    DFFockEngine dffockengine(obs,dfbs);
+#endif // HAVE_DENSITY_FITTING
+
 
     /*** =========================== ***/
     /*** compute 1-e integrals       ***/
@@ -171,6 +253,18 @@ int main(int argc, char *argv[]) {
 
     // initializes the Libint integrals library ... now ready to compute
     libint2::init();
+
+    // compute OBS non-negligible shell-pair list
+    {
+      obs_shellpair_list = compute_shellpair_list(obs);
+      size_t nsp = 0;
+      for(auto& sp: obs_shellpair_list) {
+        nsp += sp.second.size();
+      }
+      std::cout << "# of {all,non-negligible} shell-pairs = {"
+                << obs.size()*(obs.size()+1)/2 << ","
+                << nsp << "}" << std::endl;
+    }
 
     // compute one-body integrals
     auto S = compute_1body_ints<libint2::OneBodyEngine::overlap>(obs)[0];
@@ -181,6 +275,8 @@ int main(int argc, char *argv[]) {
     V.resize(0,0);
 
     Matrix D;
+    Matrix C_occ;
+    Matrix evals;
     {  // use SOAD as the guess density
       const auto tstart = std::chrono::high_resolution_clock::now();
 
@@ -202,21 +298,12 @@ int main(int argc, char *argv[]) {
         auto C = gen_eig_solver.eigenvectors();
 
         // compute density, D = C(occ) . C(occ)T
-        auto C_occ = C.leftCols(ndocc);
+        C_occ = C.leftCols(ndocc);
         D = C_occ * C_occ.transpose();
 
         const auto tstop = std::chrono::high_resolution_clock::now();
         const std::chrono::duration<double> time_elapsed = tstop - tstart;
         std::cout << "done (" << time_elapsed.count() << " s)" << std::endl;
-
-#ifdef LIBINT2_HAVE_BTAS
-        auto dfbs = BasisSet("cc-pVDZ-RI", atoms);
-        cout << "DF basis rank = " << dfbs.nbf() << endl;
-        auto tmp = compute_2body_fock_dfC(obs,
-                                          dfbs,
-                                          C_occ);
-        assert(false);
-#endif // LIBINT2_HAVE_BTAS
 
       }
     }
@@ -237,7 +324,7 @@ int main(int argc, char *argv[]) {
     auto n2 = D.cols() * D.rows();
     libint2::DIIS<Matrix> diis(2); // start DIIS on second iteration
 
-    // prepare for incremental Fock build
+    // prepare for incremental Fock build ...
     Matrix D_diff = D;
     Matrix F = H;
     bool reset_incremental_fock_formation = false;
@@ -245,6 +332,8 @@ int main(int argc, char *argv[]) {
     double start_incremental_F_threshold = 1e-5;
     double next_reset_threshold = 0.0;
     size_t last_reset_iteration = 0;
+    // ... unless doing DF, then use MO coefficients, hence not "incremental"
+    if (do_density_fitting) start_incremental_F_threshold = 0.0;
 
     do {
       const auto tstart = std::chrono::high_resolution_clock::now();
@@ -273,8 +362,17 @@ int main(int argc, char *argv[]) {
       }
 
       // build a new Fock matrix
-      const auto precision_F = std::min(1e-7,std::max(rms_error/1e4,std::numeric_limits<double>::epsilon()));
-      F += compute_2body_fock(obs, D_diff, precision_F, K);
+      if (not do_density_fitting) {
+        const auto precision_F = std::min(1e-7,std::max(rms_error/1e4,std::numeric_limits<double>::epsilon()));
+        F += compute_2body_fock(obs, D_diff, precision_F, K);
+      }
+#if HAVE_DENSITY_FITTING
+      else { // do DF
+        F = H + dffockengine.compute_2body_fock_dfC(C_occ);
+      }
+#else
+      else { assert(false); } // do_density_fitting is true but HAVE_DENSITY_FITTING is not defined! should not happen
+#endif // HAVE_DENSITY_FITTING
 
       // compute HF energy with the non-extrapolated Fock matrix
       ehf = D.cwiseProduct(H+F).sum();
@@ -293,11 +391,11 @@ int main(int argc, char *argv[]) {
 
       // solve F C = e S C
       Eigen::GeneralizedSelfAdjointEigenSolver<Matrix> gen_eig_solver(F_diis, S);
-      auto eps = gen_eig_solver.eigenvalues();
+      evals = gen_eig_solver.eigenvalues();
       auto C = gen_eig_solver.eigenvectors();
 
       // compute density, D = C(occ) . C(occ)T
-      auto C_occ = C.leftCols(ndocc);
+      C_occ = C.leftCols(ndocc);
       D = C_occ * C_occ.transpose();
       D_diff = D - D_last;
 
@@ -321,6 +419,54 @@ int main(int argc, char *argv[]) {
       qu[k] = -2 * D.cwiseProduct(Mu[k+4]).sum(); // 2 = alpha + beta, -1 = electron charge
     std::cout << "** edipole = "; std::copy(mu.begin(), mu.end(), std::ostream_iterator<double>(std::cout, " ")); std::cout << std::endl;
     std::cout << "** equadrupole = ";std::copy(qu.begin(), qu.end(), std::ostream_iterator<double>(std::cout, " ")); std::cout << std::endl;
+
+#if LIBINT2_DERIV_ONEBODY_ORDER
+    // compute forces
+    {
+      Matrix F1 = Matrix::Zero(atoms.size(), 3);
+      Matrix F_Pulay = Matrix::Zero(atoms.size(), 3);
+      //////////
+      // one-body contributions to the forces
+      //////////
+      auto T1 = compute_1body_deriv_ints<libint2::OneBodyEngine::kinetic>(1, obs, atoms);
+      auto V1 = compute_1body_deriv_ints<libint2::OneBodyEngine::nuclear>(1, obs, atoms);
+      for(auto atom=0, i=0; atom!=atoms.size(); ++atom) {
+        for(auto xyz=0; xyz!=3; ++xyz, ++i) {
+          auto force = 2 * (T1[i]+V1[i]).cwiseProduct(D).sum();
+          F1(atom, xyz) += force;
+//        std::cout << "one-body force=" << force << std::endl;
+//        std::cout << "derivative nuclear ints:\n" << V1[i] << std::endl;
+        }
+      }
+
+      //////////
+      // Pulay force
+      //////////
+      // orbital energy density
+      DiagonalMatrix evals_occ(evals.topRows(ndocc));
+      Matrix W = C_occ * evals_occ * C_occ.transpose();
+      auto S1 = compute_1body_deriv_ints<libint2::OneBodyEngine::overlap>(1, obs, atoms);
+      for(auto atom=0, i=0; atom!=atoms.size(); ++atom) {
+        for(auto xyz=0; xyz!=3; ++xyz, ++i) {
+          auto force = 2 * S1[i].cwiseProduct(W).sum();
+          F_Pulay(atom, xyz) -= force;
+//        std::cout << "Pulay force=" << force << std::endl;
+//        std::cout << "derivative overlap ints:\n" << S1[i] << std::endl;
+        }
+      }
+
+      std::cout << "** 1-body forces = ";
+      for(int atom=0; atom!=atoms.size(); ++atom)
+        for(int xyz=0; xyz!=3; ++xyz)
+          std::cout << F1(atom,xyz) << " ";
+      std::cout << std::endl;
+      std::cout << "** Pulay forces = ";
+      for(int atom=0; atom!=atoms.size(); ++atom)
+        for(int xyz=0; xyz!=3; ++xyz)
+          std::cout << F_Pulay(atom,xyz) << " ";
+      std::cout << std::endl;
+    }
+#endif
 
     printf("** Hartree-Fock energy = %20.12f\n", ehf + enuc);
 
@@ -445,7 +591,7 @@ compute_1body_ints(const BasisSet& obs,
   const unsigned int nopers = libint2::OneBodyEngine::operator_traits<obtype>::nopers;
   result_type result; for(auto& r: result) r = Matrix::Zero(n,n);
 
-  // construct the overlap integrals engine
+  // construct the 1-body integrals engine
   std::vector<libint2::OneBodyEngine> engines(nthreads);
   engines[0] = libint2::OneBodyEngine(obtype, obs.max_nprim(), obs.max_l(), 0);
   // nuclear attraction ints engine needs to know where the charges sit ...
@@ -508,10 +654,126 @@ compute_1body_ints(const BasisSet& obs,
   return result;
 }
 
-Matrix compute_schwartz_ints(const BasisSet& obs) {
+#if LIBINT2_DERIV_ONEBODY_ORDER
+template <libint2::OneBodyEngine::operator_type obtype>
+std::vector<Matrix>
+compute_1body_deriv_ints(unsigned deriv_order,
+                         const BasisSet& obs,
+                         const std::vector<Atom>& atoms)
+{
+  const auto n = obs.nbf();
+  const auto nshells = obs.size();
+#ifdef _OPENMP
+  const auto nthreads = omp_get_max_threads();
+#else
+  const auto nthreads = 1;
+#endif
+  constexpr auto nopers = libint2::OneBodyEngine::operator_traits<obtype>::nopers;
+  const auto nresults = nopers * libint2::num_geometrical_derivatives(atoms.size(),deriv_order);
+  typedef std::vector<Matrix> result_type;
+  result_type result(nresults); for(auto& r: result) r = Matrix::Zero(n,n);
 
-  const auto nsh = obs.size();
-  Matrix K = Matrix::Zero(nsh,nsh);
+  // construct the 1-body integrals engine
+  std::vector<libint2::OneBodyEngine> engines(nthreads);
+  engines[0] = libint2::OneBodyEngine(obtype, obs.max_nprim(), obs.max_l(), deriv_order);
+  // nuclear attraction ints engine needs to know where the charges sit ...
+  // the nuclei are charges in this case; in QM/MM there will also be classical charges
+  if (obtype == libint2::OneBodyEngine::nuclear) {
+    std::vector<std::pair<double,std::array<double,3>>> q;
+    for(const auto& atom : atoms) {
+      q.push_back( {static_cast<double>(atom.atomic_number), {{atom.x, atom.y, atom.z}}} );
+    }
+    engines[0].set_params(q);
+  }
+  for(size_t i=1; i!=nthreads; ++i) {
+    engines[i] = engines[0];
+  }
+
+  auto shell2bf = obs.shell2bf();
+  auto shell2atom = obs.shell2atom(atoms);
+
+#ifdef _OPENMP
+  #pragma omp parallel
+#endif
+  {
+#ifdef _OPENMP
+    auto thread_id = omp_get_thread_num();
+#else
+    auto thread_id = 0;
+#endif
+
+    // loop over unique shell pairs, {s1,s2} such that s1 >= s2
+    // this is due to the permutational symmetry of the real integrals over Hermitian operators: (1|2) = (2|1)
+    for(auto s1=0l, s12=0l; s1!=nshells; ++s1) {
+
+      auto bf1 = shell2bf[s1]; // first basis function in this shell
+      auto n1 = obs[s1].size();
+      auto atom1 = shell2atom[s1];
+      assert(atom1 != -1);
+
+      for(auto s2=0; s2<=s1; ++s2) {
+
+        if (s12 % nthreads != thread_id)
+          continue;
+
+        auto bf2 = shell2bf[s2];
+        auto n2 = obs[s2].size();
+        auto atom2 = shell2atom[s2];
+
+        auto n12 = n1 * n2;
+
+        // compute shell pair; return is the pointer to the buffer
+        const auto* buf = engines[thread_id].compute(obs[s1], obs[s2]);
+
+        assert(deriv_order == 1); // the loop structure below needs to be generalized for higher-order derivatives
+        // 1. process derivatives with respect to the Gaussian origins first ...
+        for(unsigned int d=0; d!=6; ++d) { // 2 centers x 3 axes = 6 cartesian geometric derivatives
+          auto atom = d < 3 ? atom1 : atom2;
+          auto op_start = (3*atom+d%3) * nopers;
+          auto op_fence = op_start + nopers;
+          for(unsigned int op=op_start; op!=op_fence; ++op, buf+=n12) {
+            // "map" buffer to a const Eigen Matrix, and copy it to the corresponding blocks of the result
+            Eigen::Map<const Matrix> buf_mat(buf, n1, n2);
+//            std::cout << "s1=" << s1 << " s2=" << s2 << " x=" << (3*atom+d%3) << " op=" << op-op_start << ":\n";
+//            std::cout << buf_mat << std::endl;
+            result[op].block(bf1, bf2, n1, n2) += buf_mat;
+            if (s1 != s2) // if s1 >= s2, copy {s1,s2} to the corresponding {s2,s1} block, note the transpose!
+              result[op].block(bf2, bf1, n2, n1) += buf_mat.transpose();
+          }
+        }
+        // 2. process derivatives of nuclear Coulomb operator, if needed
+        if (obtype == libint2::OneBodyEngine::nuclear) {
+          for(unsigned int atom=0; atom!=atoms.size(); ++atom) {
+            for(unsigned int xyz=0; xyz!=3; ++xyz) {
+              auto op_start = (3*atom+xyz) * nopers;
+              auto op_fence = op_start + nopers;
+              for(unsigned int op=op_start; op!=op_fence; ++op, buf+=n12) {
+                Eigen::Map<const Matrix> buf_mat(buf, n1, n2);
+                result[op].block(bf1, bf2, n1, n2) += buf_mat;
+                if (s1 != s2) // if s1 >= s2, copy {s1,s2} to the corresponding {s2,s1} block, note the transpose!
+                  result[op].block(bf2, bf1, n2, n1) += buf_mat.transpose();
+              }
+            }
+          }
+        }
+
+      }
+    }
+  } // omp parallel
+
+  return result;
+}
+#endif
+
+Matrix compute_schwartz_ints(const BasisSet& bs1,
+                             const BasisSet& _bs2,
+                             bool use_2norm) {
+  const BasisSet& bs2 = (_bs2.empty() ? bs1 : _bs2);
+  const auto nsh1 = bs1.size();
+  const auto nsh2 = bs2.size();
+  const auto bs1_equiv_bs2 = (&bs1 == &bs2);
+
+  Matrix K = Matrix::Zero(nsh1,nsh2);
 #ifdef _OPENMP
   const auto nthreads = omp_get_max_threads();
 #else
@@ -521,7 +783,7 @@ Matrix compute_schwartz_ints(const BasisSet& obs) {
   // construct the 2-electron repulsion integrals engine
   typedef libint2::TwoBodyEngine<libint2::Coulomb> coulomb_engine_type;
   std::vector<coulomb_engine_type> engines(nthreads);
-  engines[0] = coulomb_engine_type(obs.max_nprim(), obs.max_l(), 0);
+  engines[0] = coulomb_engine_type(bs1.max_nprim(), bs2.max_l(), 0);
   engines[0].set_precision(0.); // !!! very important: cannot screen primitives in Schwartz computation !!!
   for(size_t i=1; i!=nthreads; ++i) {
     engines[i] = engines[0];
@@ -544,29 +806,26 @@ Matrix compute_schwartz_ints(const BasisSet& obs) {
 #endif
 
     // loop over permutationally-unique set of shells
-    for(auto s1=0l, s12=0l; s1!=nsh; ++s1) {
+    for(auto s1=0l, s12=0l; s1!=nsh1; ++s1) {
 
-      auto n1 = obs[s1].size();// number of basis functions in this shell
+      auto n1 = bs1[s1].size();// number of basis functions in this shell
 
-      for(auto s2=0; s2<=s1; ++s2, ++s12) {
+      auto s2_max = bs1_equiv_bs2 ? s1 : nsh2-1;
+      for(auto s2=0; s2<=s2_max; ++s2, ++s12) {
 
         if (s12 % nthreads != thread_id)
           continue;
 
-        auto n2 = obs[s2].size();
+        auto n2 = bs2[s2].size();
         auto n12 = n1*n2;
 
-        const auto* buf = engines[thread_id].compute(obs[s1], obs[s2], obs[s1], obs[s2]);
+        const auto* buf = engines[thread_id].compute(bs1[s1], bs2[s2], bs1[s1], bs2[s2]);
 
-        // extract ints into an Eigen Matrix
-        Matrix shblk = Matrix::Zero(n1, n2);
-        for(size_t f1=0, f12=0; f1!=n1; ++f1)
-          for(size_t f2=0; f2!=n2; ++f2, ++f12) {
-            const auto int1212 = buf[f12 * n12 + f12];
-            shblk(f1, f2) = int1212;
-          }
-
-        K(s1,s2) = K(s2,s1) = std::sqrt(shblk.lpNorm<Eigen::Infinity>());
+        // the diagonal elements are the Schwartz ints ... use Map.diagonal()
+        Eigen::Map<const Matrix> buf_mat(buf, n12, n12);
+        auto norm2 = use_2norm ? buf_mat.diagonal().norm() : buf_mat.diagonal().lpNorm<Eigen::Infinity>();
+        K(s1,s2) = std::sqrt(norm2);
+        if (bs1_equiv_bs2) K(s2,s1) = K(s1,s2);
 
       }
     }
@@ -576,6 +835,173 @@ Matrix compute_schwartz_ints(const BasisSet& obs) {
   std::cout << "done (" << timer.read(0) << " s)"<< std::endl;
 
   return K;
+}
+
+Matrix compute_do_ints(const BasisSet& bs1,
+                       const BasisSet& _bs2,
+                       bool use_2norm) {
+  const BasisSet& bs2 = (_bs2.empty() ? bs1 : _bs2);
+  const auto nsh1 = bs1.size();
+  const auto nsh2 = bs2.size();
+  const auto bs1_equiv_bs2 = (&bs1 == &bs2);
+
+  Matrix K = Matrix::Zero(nsh1,nsh2);
+#ifdef _OPENMP
+  const auto nthreads = omp_get_max_threads();
+#else
+  const auto nthreads = 1;
+#endif
+
+  // construct the 2-electron repulsion integrals engine
+  typedef libint2::TwoBodyEngine<libint2::Delta> coulomb_engine_type;
+  std::vector<coulomb_engine_type> engines(nthreads);
+  engines[0] = coulomb_engine_type(bs1.max_nprim(), bs2.max_l(), 0);
+  engines[0].set_precision(0.); // !!! very important: cannot screen primitives in Schwartz computation !!!
+  for(size_t i=1; i!=nthreads; ++i) {
+    engines[i] = engines[0];
+  }
+
+  std::cout << "computing DOIs ... ";
+
+  libint2::Timers<1> timer;
+  timer.set_now_overhead(25);
+  timer.start(0);
+
+#ifdef _OPENMP
+  #pragma omp parallel
+#endif
+  {
+#ifdef _OPENMP
+    auto thread_id = omp_get_thread_num();
+#else
+    auto thread_id = 0;
+#endif
+
+    // loop over permutationally-unique set of shells
+    for(auto s1=0l, s12=0l; s1!=nsh1; ++s1) {
+
+      auto n1 = bs1[s1].size();// number of basis functions in this shell
+
+      auto s2_max = bs1_equiv_bs2 ? s1 : nsh2-1;
+      for(auto s2=0; s2<=s2_max; ++s2, ++s12) {
+
+        if (s12 % nthreads != thread_id)
+          continue;
+
+        auto n2 = bs2[s2].size();
+        auto n12 = n1*n2;
+
+        const auto* buf = engines[thread_id].compute(bs1[s1], bs2[s2], bs1[s1], bs2[s2]);
+
+        // the diagonal elements are the Schwartz ints ... use Map.diagonal()
+        Eigen::Map<const Matrix> buf_mat(buf, n12, n12);
+        auto norm2 = use_2norm ? buf_mat.diagonal().norm() : buf_mat.diagonal().lpNorm<Eigen::Infinity>();
+        K(s1,s2) = std::sqrt(norm2);
+        if (bs1_equiv_bs2) K(s2,s1) = K(s1,s2);
+
+      }
+    }
+  }
+
+  timer.stop(0);
+  std::cout << "done (" << timer.read(0) << " s)"<< std::endl;
+
+  return K;
+}
+
+shellpair_list_t
+compute_shellpair_list(const BasisSet& bs1,
+                       const BasisSet& _bs2,
+                       const double threshold) {
+  const BasisSet& bs2 = (_bs2.empty() ? bs1 : _bs2);
+  const auto nsh1 = bs1.size();
+  const auto nsh2 = bs2.size();
+  const auto bs1_equiv_bs2 = (&bs1 == &bs2);
+
+#ifdef _OPENMP
+  const auto nthreads = omp_get_max_threads();
+#else
+  const auto nthreads = 1;
+#endif
+
+  // construct the 2-electron repulsion integrals engine
+  using libint2::OneBodyEngine;
+  std::vector<OneBodyEngine> engines; engines.reserve(nthreads);
+  engines.emplace_back(OneBodyEngine::overlap,
+                       std::max(bs1.max_nprim(),bs2.max_nprim()),
+                       std::max(bs1.max_l(),bs2.max_l()),
+                       0);
+  for(size_t i=1; i!=nthreads; ++i) {
+    engines.push_back(engines[0]);
+  }
+
+  std::cout << "computing non-negligible shell-pair list ... ";
+
+  libint2::Timers<1> timer;
+  timer.set_now_overhead(25);
+  timer.start(0);
+
+  shellpair_list_t result;
+
+  std::mutex mx;
+
+  auto compute = [&] (int thread_id) {
+
+    auto& engine = engines[thread_id];
+
+    // loop over permutationally-unique set of shells
+    for(auto s1=0l, s12=0l; s1!=nsh1; ++s1) {
+
+      mx.lock();
+      if (result.find(s1) == result.end())
+        result.insert(std::make_pair(s1,std::vector<size_t>()));
+      mx.unlock();
+
+      auto n1 = bs1[s1].size();// number of basis functions in this shell
+
+      auto s2_max = bs1_equiv_bs2 ? s1 : nsh2-1;
+      for(auto s2=0; s2<=s2_max; ++s2, ++s12) {
+
+        if (s12 % nthreads != thread_id)
+          continue;
+
+        auto on_same_center = (bs1[s1].O == bs2[s2].O);
+        bool significant = on_same_center;
+        if (not on_same_center) {
+          auto n2 = bs2[s2].size();
+          const auto* buf = engines[thread_id].compute(bs1[s1], bs2[s2]);
+          Eigen::Map<const Matrix> buf_mat(buf, n1, n2);
+          auto norm = buf_mat.norm();
+          significant = (norm >= threshold);
+        }
+
+        if (significant) {
+          mx.lock();
+          result[s1].emplace_back(s2);
+          mx.unlock();
+        }
+      }
+    }
+  }; // end of compute
+
+  libint2::parallel_do(compute);
+
+  // resort shell list in increasing order, i.e. result[s][s1] < result[s][s2] if s1 < s2
+  auto sort = [&] (int thread_id) {
+    for(auto s1=0l; s1!=nsh1; ++s1) {
+      if (s1%nthreads == thread_id) {
+        auto& list = result[s1];
+        std::sort(list.begin(), list.end());
+      }
+    }
+  }; // end of sort
+
+  libint2::parallel_do(sort);
+
+  timer.stop(0);
+  std::cout << "done (" << timer.read(0) << " s)"<< std::endl;
+
+  return result;
 }
 
 Matrix compute_2body_2index_ints(const BasisSet& bs)
@@ -693,7 +1119,7 @@ Matrix compute_2body_fock(const BasisSet& obs,
       auto bf1_first = shell2bf[s1]; // first basis function in this shell
       auto n1 = obs[s1].size();// number of basis functions in this shell
 
-      for(auto s2=0; s2<=s1; ++s2) {
+      for(const auto& s2: obs_shellpair_list[s1]) {
 
         auto bf2_first = shell2bf[s2];
         auto n2 = obs[s2].size();
@@ -711,9 +1137,10 @@ Matrix compute_2body_fock(const BasisSet& obs,
                                                    : 0.;
 
           const auto s4_max = (s1 == s3) ? s2 : s3;
-          for(auto s4=0; s4<=s4_max; ++s4, ++s1234) {
+          for(const auto& s4: obs_shellpair_list[s3]) {
+            if (s4 > s4_max) break; // for each s3, s4 are stored in monotonically increasing order
 
-            if (s1234 % nthreads != thread_id)
+            if ((s1234++) % nthreads != thread_id)
               continue;
 
             const auto Dnorm1234 = do_schwartz_screen ? std::max(D_shblk_norm(s1,s4),
@@ -788,24 +1215,7 @@ Matrix compute_2body_fock(const BasisSet& obs,
 
   }; // end of lambda
 
-#ifdef _OPENMP
-  #pragma omp parallel
-  {
-    auto thread_id = omp_get_thread_num();
-    lambda(thread_id);
-  }
-#else // use C++11 threads
-  std::vector<std::thread> threads;
-  for(int thread_id=0; thread_id != nthreads; ++thread_id) {
-    if(thread_id != nthreads-1)
-      threads.push_back(std::thread(lambda,
-                                    thread_id));
-    else
-      lambda(thread_id);
-  } // threads_id
-  for(int thread_id=0; thread_id<nthreads-1; ++thread_id)
-    threads[thread_id].join();
-#endif
+  libint2::parallel_do(lambda);
 
   // accumulate contributions from all threads
   for(size_t i=1; i!=nthreads; ++i) {
@@ -837,14 +1247,11 @@ Matrix compute_2body_fock_general(const BasisSet& obs,
                                   double precision) {
 
   const auto n = obs.nbf();
+  const auto nshells = obs.size();
   const auto n_D = D_bs.nbf();
   assert(D.cols() == D.rows() && D.cols() == n_D);
 
-#ifdef _OPENMP
-  const auto nthreads = omp_get_max_threads();
-#else
-  const auto nthreads = 1;
-#endif
+  using libint2::nthreads;
   std::vector<Matrix> G(nthreads, Matrix::Zero(n,n));
 
   // construct the 2-electron repulsion integrals engine
@@ -860,19 +1267,13 @@ Matrix compute_2body_fock_general(const BasisSet& obs,
   auto shell2bf = obs.shell2bf();
   auto shell2bf_D = D_bs.shell2bf();
 
-#ifdef _OPENMP
-  #pragma omp parallel
-#endif
-  {
-#ifdef _OPENMP
-    auto thread_id = omp_get_thread_num();
-#else
-    auto thread_id = 0;
-#endif
+  auto lambda = [&] (int thread_id) {
 
-    auto s1234 = 0ul;
+    auto& engine = engines[thread_id];
+    auto& g = G[thread_id];
+
     // loop over permutationally-unique set of shells
-    for(auto s1=0; s1!=obs.size(); ++s1) {
+    for(auto s1=0l, s1234=0l; s1!=nshells; ++s1) {
 
       auto bf1_first = shell2bf[s1]; // first basis function in this shell
       auto n1 = obs[s1].size();   // number of basis functions in this shell
@@ -905,7 +1306,7 @@ Matrix compute_2body_fock_general(const BasisSet& obs,
               auto s34_deg = (s3 == s4) ? 1.0 : 2.0;
               auto s1234_deg = s12_deg * s34_deg;
               //auto s1234_deg = s12_deg;
-              const auto* buf_J = engines[thread_id].compute(obs[s1], obs[s2], D_bs[s3], D_bs[s4]);
+              const auto* buf_J = engine.compute(obs[s1], obs[s2], D_bs[s3], D_bs[s4]);
 
               for(auto f1=0, f1234=0; f1!=n1; ++f1) {
                 const auto bf1 = f1 + bf1_first;
@@ -916,8 +1317,6 @@ Matrix compute_2body_fock_general(const BasisSet& obs,
                     for(auto f4=0; f4!=n4; ++f4, ++f1234) {
                       const auto bf4 = f4 + bf4_first;
 
-                      auto& g = G[thread_id];
-
                       const auto value = buf_J[f1234];
                       const auto value_scal_by_deg = value * s1234_deg;
                       g(bf1,bf2) += 2.0 * D(bf3,bf4) * value_scal_by_deg;
@@ -927,7 +1326,7 @@ Matrix compute_2body_fock_general(const BasisSet& obs,
               }
             }
 
-            const auto* buf_K = engines[thread_id].compute(obs[s1], D_bs[s3], obs[s2], D_bs[s4]);
+            const auto* buf_K = engine.compute(obs[s1], D_bs[s3], obs[s2], D_bs[s4]);
 
             for(auto f1=0, f1324=0; f1!=n1; ++f1) {
               const auto bf1 = f1 + bf1_first;
@@ -937,8 +1336,6 @@ Matrix compute_2body_fock_general(const BasisSet& obs,
                   const auto bf2 = f2 + bf2_first;
                   for(auto f4=0; f4!=n4; ++f4, ++f1324) {
                     const auto bf4 = f4 + bf4_first;
-
-                    auto& g = G[thread_id];
 
                     const auto value = buf_K[f1324];
                     const auto value_scal_by_deg = value * s12_deg;
@@ -953,7 +1350,9 @@ Matrix compute_2body_fock_general(const BasisSet& obs,
       }
     }
 
-  } // omp parallel
+  }; // thread lambda
+
+  libint2::parallel_do(lambda);
 
   // accumulate contributions from all threads
   for(size_t i=1; i!=nthreads; ++i) {
@@ -964,10 +1363,13 @@ Matrix compute_2body_fock_general(const BasisSet& obs,
   return 0.5 * (G[0] + G[0].transpose());
 }
 
-#ifdef LIBINT2_HAVE_BTAS
-Matrix compute_2body_fock_dfC(const BasisSet& obs,
-                              const BasisSet& dfbs,
-                              const Matrix& Cocc) {
+#ifdef HAVE_DENSITY_FITTING
+
+// uncomment if want to compute statistics of shell blocks
+//#define COMPUTE_DF_INTS_STATS 1
+
+Matrix
+DFFockEngine::compute_2body_fock_dfC(const Matrix& Cocc) {
 
 #ifdef _OPENMP
   const auto nthreads = omp_get_max_threads();
@@ -977,151 +1379,50 @@ Matrix compute_2body_fock_dfC(const BasisSet& obs,
 
   const auto n          =  obs.nbf();
   const auto ndf        = dfbs.nbf();
-  const auto nshells    =  obs.size();
-  const auto nshells_df = dfbs.size();
-  const auto unitshell = libint2::Shell::unit();
-
-  // construct the 2-electron 3-center repulsion integrals engine
-  typedef libint2::TwoBodyEngine<libint2::Coulomb> coulomb_engine_type;
-  std::vector<coulomb_engine_type> engines(nthreads);
-  engines[0] = coulomb_engine_type(std::max(obs.max_nprim(), dfbs.max_nprim()),
-                                   std::max(obs.max_l(), dfbs.max_l()), 0);
-  for(size_t i=1; i!=nthreads; ++i) {
-    engines[i] = engines[0];
-  }
-
 #ifndef _OPENMP
-  libint2::Timers<3> timer;
+  libint2::Timers<5> timer;
   timer.set_now_overhead(25);
 #endif // not defined _OPENMP
 
-  auto shell2bf    =  obs.shell2bf();
-  auto shell2bf_df = dfbs.shell2bf();
-
-  typedef btas::RangeNd<CblasRowMajor, std::array<long, 3> > Range3d;
-  typedef btas::Tensor<double, Range3d> Tensor3d;
-  Tensor3d xyZ{n, n, ndf};
-
-#ifdef _OPENMP
-  #pragma omp parallel
-#endif
-  {
-#ifdef _OPENMP
-    auto thread_id = omp_get_thread_num();
-#else
-    auto thread_id = 0;
-#endif
-
-    // loop over permutationally-unique set of shells
-    for(auto s1=0l, s123=0l; s1!=nshells; ++s1) {
-
-      auto bf1_first = shell2bf[s1]; // first basis function in this shell
-      auto n1 = obs[s1].size();// number of basis functions in this shell
-
-      for(auto s2=0; s2!=nshells; ++s2) {
-
-        auto bf2_first = shell2bf[s2];
-        auto n2 = obs[s2].size();
-        const auto n12 = n1*n2;
-
-        for(auto s3=0; s3!=nshells_df; ++s3, ++s123) {
-
-          if (s123 % nthreads != thread_id)
-            continue;
-
-          auto bf3_first = shell2bf_df[s3];
-          auto n3 = dfbs[s3].size();
-          const auto n123 = n12*n3;
-
-#ifndef _OPENMP
-          timer.start(0);
-#endif
-
-          const auto* buf = engines[thread_id].compute(obs[s1], obs[s2], dfbs[s3], unitshell);
-
-#ifndef _OPENMP
-          timer.stop(0);
-#endif
-
-
-#ifndef _OPENMP
-          timer.start(1);
-#endif
-
-          auto lower_bound = {bf1_first, bf2_first, bf3_first};
-          auto upper_bound = {bf1_first+n1, bf2_first+n2, bf3_first+n3};
-          auto view = btas::make_view( xyZ.range().slice(lower_bound, upper_bound),
-                                       xyZ.storage());
-          std::copy(buf, buf+n123, view.begin());
-
-#ifndef _OPENMP
-          timer.stop(1);
-#endif
-
-        } // s3
-      } // s2
-    } // s1
-
-  } // omp parallel
-
-#ifndef _OPENMP
-  std::cout << "time for integrals = " << timer.read(0) << std::endl;
-  std::cout << "time for copying into BTAS = " << timer.read(1) << std::endl;
-  engines[0].print_timers();
-#endif // not defined _OPENMP
-
-  timer.start(2);
-
-  Matrix V = compute_2body_2index_ints(dfbs);
-  Eigen::LLT<Matrix> V_LLt(V);
-  Matrix I = Matrix::Identity(ndf, ndf);
-  auto L = V_LLt.matrixL();
-  Matrix V_L = L;
-  Matrix Linv = L.solve(I).transpose();
-  // check
-//  std::cout << "||V - L L^t|| = " << (V - V_L * V_L.transpose()).norm() << std::endl;
-//  std::cout << "||I - L L^-1^t|| = " << (I - V_L * Linv.transpose()).norm() << std::endl;
-//  std::cout << "||V^-1 - L^-1 L^-1^t|| = " << (V.inverse() - Linv * Linv.transpose()).norm() << std::endl;
-
+  typedef btas::RangeNd<CblasRowMajor, std::array<long, 1> > Range1d;
   typedef btas::RangeNd<CblasRowMajor, std::array<long, 2> > Range2d;
+  typedef btas::Tensor<double, Range1d> Tensor1d;
   typedef btas::Tensor<double, Range2d> Tensor2d;
-  Tensor2d K{ndf, ndf};
-  std::copy(Linv.data(), Linv.data()+ndf*ndf, K.begin());
 
-  Tensor3d xyK{n, n, ndf};
-  btas::contract(1.0, xyZ, {1,2,3}, K, {3,4}, 0.0, xyK, {1,2,4});
-  xyZ = Tensor3d{0,0,0};
+  // using first time? compute 3-center ints and transform to inv sqrt repreentation
+  if (xyK.size() == 0) {
 
-  typedef Eigen::Map<const Matrix> ConstMap;
-  typedef Eigen::Map<Matrix> Map;
-  const auto nocc = Cocc.cols();
-  ConstMap Coccv(Cocc.data(), n, nocc);
-  Matrix Cocc_t = Coccv.transpose();
+    const auto nshells    =  obs.size();
+    const auto nshells_df = dfbs.size();
+    const auto unitshell = libint2::Shell::unit();
 
-  Tensor3d xiK{n, nocc, ndf};
-  for(auto x=0ul; x!=n; ++x) {
-    ConstMap yK(&xyK.storage()[0] + x*n*ndf, n, ndf);
-    Map iK(&xiK.storage()[0] + x*nocc*ndf, nocc, ndf);
-    iK = Cocc_t * yK;
-  }
+    // construct the 2-electron 3-center repulsion integrals engine
+    typedef libint2::TwoBodyEngine<libint2::Coulomb> coulomb_engine_type;
+    std::vector<coulomb_engine_type> engines(nthreads);
+    engines[0] = coulomb_engine_type(std::max(obs.max_nprim(), dfbs.max_nprim()),
+                                     std::max(obs.max_l(), dfbs.max_l()), 0);
+    for(size_t i=1; i!=nthreads; ++i) {
+      engines[i] = engines[0];
+    }
 
-  Tensor2d exchange{n, n};
-  btas::contract(1.0, xiK, {1,2,3}, xiK, {4,2,3}, 0.0, exchange, {1,4});
-  xiK = Tensor3d{0,0,0};
+    auto shell2bf    =  obs.shell2bf();
+    auto shell2bf_df = dfbs.shell2bf();
 
-  {
-    Map m_exchange(&exchange.storage()[0], n, n);
-    std::cout << "exchange matrix:\n" << m_exchange << std::endl;
-  }
+    Tensor3d xyZ{n, n, ndf};
 
-  // reconstruct 4-index ints
-  if (0) {
-    ConstMap xyK_map(&xyK.storage()[0], n*n, ndf);
-    Matrix xyzw_df = xyK_map * xyK_map.transpose();
-
-    typedef btas::RangeNd<CblasRowMajor, std::array<long, 4> > Range4d;
-    typedef btas::Tensor<double, Range4d> Tensor4d;
-    Tensor4d xyzw{n, n, n, n};
+#if COMPUTE_DF_INTS_STATS
+    const double count_threshold = 1e-7;
+    std::atomic<size_t> nints{0};  // number of ints in shell blocks with Frobenius norm > count_threshold
+    std::atomic<size_t> nints2{0}; // number of ints in shell blocks with Frobenius norm/elem > count_threshold
+    typedef btas::Tensor<char, Range3d> Tensor3dBool;
+    const size_t nobs_per_mol = 24; // cc-pVDZ
+    const size_t ndfbs_per_mol = 84; // cc-pVDZ-RI
+    const size_t nmols = n/nobs_per_mol;
+    Tensor3dBool nonzero_mol_blocks{nmols, nmols, nmols}; // number of molecule blocks that contain shell blocks with Frobenius norm > count_threshold
+    Tensor3d mol_blocks_frob2{nmols, nmols, nmols}; // sum of Frobenius norms squared in each molecule block
+    std::fill(nonzero_mol_blocks.begin(), nonzero_mol_blocks.end(), 0);
+    std::fill(mol_blocks_frob2.begin(), mol_blocks_frob2.end(), 0.);
+#endif // COMPUTE_DF_INTS_STATS
 
   #ifdef _OPENMP
     #pragma omp parallel
@@ -1134,7 +1435,7 @@ Matrix compute_2body_fock_dfC(const BasisSet& obs,
   #endif
 
       // loop over permutationally-unique set of shells
-      for(auto s1=0l, s1234=0l; s1!=nshells; ++s1) {
+      for(auto s1=0l, s123=0l; s1!=nshells; ++s1) {
 
         auto bf1_first = shell2bf[s1]; // first basis function in this shell
         auto n1 = obs[s1].size();// number of basis functions in this shell
@@ -1145,65 +1446,147 @@ Matrix compute_2body_fock_dfC(const BasisSet& obs,
           auto n2 = obs[s2].size();
           const auto n12 = n1*n2;
 
-          for(auto s3=0; s3!=nshells; ++s3) {
+          for(auto s3=0; s3!=nshells_df; ++s3, ++s123) {
 
-            auto bf3_first = shell2bf[s3];
-            auto n3 = obs[s3].size();
+            if (s123 % nthreads != thread_id)
+              continue;
+
+            auto bf3_first = shell2bf_df[s3];
+            auto n3 = dfbs[s3].size();
             const auto n123 = n12*n3;
 
-            for(auto s4=0; s4!=nshells; ++s4, ++s1234) {
+  #ifndef _OPENMP
+            timer.start(0);
+  #endif
 
-              if (s1234 % nthreads != thread_id)
-                continue;
+            const auto* buf = engines[thread_id].compute(obs[s1], obs[s2], dfbs[s3], unitshell);
 
-              auto bf4_first = shell2bf[s4];
-              auto n4 = obs[s4].size();
-              const auto n1234 = n123*n4;
+  #ifndef _OPENMP
+            timer.stop(0);
+  #endif
 
-#ifndef _OPENMP
-              timer.start(0);
-#endif
+#if COMPUTE_DF_INTS_STATS
+            const auto buf_2norm = sqrt(std::inner_product(buf, buf+n123, buf, 0.));
+            const auto buf_2norm_scaled = sqrt(buf_2norm * buf_2norm/ n123);
+            const auto buf_infnorm = std::abs(
+                  *std::max_element(buf, buf+n123, [](double a, double b){return std::abs(a) < std::abs(b);})
+            );
+            if (buf_2norm > count_threshold) {
+              nints += n123;
 
-              const auto* buf = engines[thread_id].compute(obs[s1], obs[s2], obs[s3], obs[s4]);
+              nonzero_mol_blocks(bf1_first/nobs_per_mol,
+                                 bf2_first/nobs_per_mol,
+                                 bf3_first/ndfbs_per_mol) = 1;
+            }
+            if (buf_2norm_scaled > count_threshold) {
+              nints2 += n123;
+            }
+            mol_blocks_frob2(bf1_first/nobs_per_mol,
+                             bf2_first/nobs_per_mol,
+                             bf3_first/ndfbs_per_mol) += buf_2norm*buf_2norm;
+#endif // COMPUTE_DF_INTS_STATS
 
-#ifndef _OPENMP
-              timer.stop(0);
-#endif
+  #ifndef _OPENMP
+            timer.start(1);
+  #endif
 
+            auto lower_bound = {bf1_first, bf2_first, bf3_first};
+            auto upper_bound = {bf1_first+n1, bf2_first+n2, bf3_first+n3};
+            auto view = btas::make_view( xyZ.range().slice(lower_bound, upper_bound),
+                                         xyZ.storage());
+            std::copy(buf, buf+n123, view.begin());
 
-#ifndef _OPENMP
-              timer.start(1);
-#endif
+  #ifndef _OPENMP
+            timer.stop(1);
+  #endif
 
-              auto lower_bound = {bf1_first, bf2_first, bf3_first, bf4_first};
-              auto upper_bound = {bf1_first+n1, bf2_first+n2, bf3_first+n3, bf4_first+n4};
-              auto view = btas::make_view( xyzw.range().slice(lower_bound, upper_bound),
-                                           xyzw.storage());
-              std::copy(buf, buf+n1234, view.begin());
-
-#ifndef _OPENMP
-              timer.stop(1);
-#endif
-
-            } // s4
           } // s3
         } // s2
       } // s1
 
     } // omp parallel
 
+  #ifndef _OPENMP
+    std::cout << "time for integrals = " << timer.read(0) << std::endl;
+    std::cout << "time for copying into BTAS = " << timer.read(1) << std::endl;
+    engines[0].print_timers();
+  #endif // not defined _OPENMP
 
-    Map xyzw_map(&xyzw.storage()[0], n*n, n*n);
-    std::cout << "4-center ints:\n" << (xyzw_map) << std::endl;
-    std::cout << "4-center ints (DF):\n" << (xyzw_df) << std::endl;
-    std::cout << "DF reconstruction error:\n" << (xyzw_map - xyzw_df) << std::endl;
-  }
+#if COMPUTE_DF_INTS_STATS
+    {
+      const auto nints_per_molblock = nobs_per_mol * nobs_per_mol * ndfbs_per_mol;
+      const size_t nints_mols = std::count(nonzero_mol_blocks.begin(), nonzero_mol_blocks.end(), 1) *
+                                nints_per_molblock;
+      const size_t nints_mols2= std::count_if(mol_blocks_frob2.begin(), mol_blocks_frob2.end(),
+                                              [&](double a) { return sqrt(a) > count_threshold; }
+                                             ) *
+                                                 nints_per_molblock;
+      const size_t nints_mols3= std::count_if(mol_blocks_frob2.begin(), mol_blocks_frob2.end(),
+                                              [&](double a) { return sqrt(a)/nints_per_molblock > count_threshold; }
+                                             ) *
+                                                 nints_per_molblock;
+      std::cout << "# of ints in shell blocks with norm greater than " << count_threshold << " = " << nints << std::endl;
+      std::cout << "# of ints in shell blocks with scaled norm greater than " << count_threshold << " = " << nints2 << std::endl;
+      std::cout << "# of ints in molecule blocks whose any shell-block norm was greater than " << count_threshold << " = " << nints_mols << std::endl;
+      std::cout << "# of ints in molecule blocks with norm greater than " << count_threshold << " = " << nints_mols2 << std::endl;
+      std::cout << "# of ints in molecule blocks with scaled norm greater than " << count_threshold << " = " << nints_mols3 << std::endl;
+      std::cout << "# of total ints = " << n*n*ndf << std::endl;
+    }
+#endif // COMPUTE_DF_INTS_STATS
 
-  timer.stop(2);
+    timer.start(2);
 
-  std::cout << "time for exchange = " << timer.read(2) << std::endl;
+    Matrix V = compute_2body_2index_ints(dfbs);
+    Eigen::LLT<Matrix> V_LLt(V);
+    Matrix I = Matrix::Identity(ndf, ndf);
+    auto L = V_LLt.matrixL();
+    Matrix V_L = L;
+    Matrix Linv = L.solve(I).transpose();
+    // check
+  //  std::cout << "||V - L L^t|| = " << (V - V_L * V_L.transpose()).norm() << std::endl;
+  //  std::cout << "||I - L L^-1^t|| = " << (I - V_L * Linv.transpose()).norm() << std::endl;
+  //  std::cout << "||V^-1 - L^-1 L^-1^t|| = " << (V.inverse() - Linv * Linv.transpose()).norm() << std::endl;
 
-  std::cout.flush();
-  exit(1);
+    Tensor2d K{ndf, ndf};
+    std::copy(Linv.data(), Linv.data()+ndf*ndf, K.begin());
+
+    xyK = Tensor3d{n, n, ndf};
+    btas::contract(1.0, xyZ, {1,2,3}, K, {3,4}, 0.0, xyK, {1,2,4});
+    xyZ = Tensor3d{0,0,0}; // release memory
+
+    timer.stop(2);
+    std::cout << "time for integrals tform = " << timer.read(2) << std::endl;
+  } // if (xyK.size() == 0)
+
+  // compute exchange
+  timer.start(3);
+
+  const auto nocc = Cocc.cols();
+  Tensor2d Co{n, nocc};
+  std::copy(Cocc.data(), Cocc.data()+n*nocc, Co.begin());
+  Tensor3d xiK{n, nocc, ndf};
+  btas::contract(1.0, xyK, {1,2,3}, Co, {2,4}, 0.0, xiK, {1,4,3});
+
+  Tensor2d G{n, n};
+  btas::contract(1.0, xiK, {1,2,3}, xiK, {4,2,3}, 0.0, G, {1,4});
+
+  timer.stop(3);
+  std::cout << "time for exchange = " << timer.read(3) << std::endl;
+
+  // compute Coulomb
+  timer.start(4);
+
+  Tensor1d Jtmp{ndf};
+  btas::contract(1.0, xiK, {1,2,3}, Co, {1,2}, 0.0, Jtmp, {3});
+  xiK = Tensor3d{0,0,0};
+  btas::contract(2.0, xyK, {1,2,3}, Jtmp, {3}, -1.0, G, {1,2});
+
+  timer.stop(4);
+  std::cout << "time for coulomb = " << timer.read(4) << std::endl;
+
+  // copy result to an Eigen::Matrix
+  Matrix result(n, n);
+  std::copy(G.cbegin(), G.cend(), result.data());
+  return result;
 }
-#endif // LIBINT2_HAVE_BTAS
+#endif // HAVE_DENSITY_FITTING

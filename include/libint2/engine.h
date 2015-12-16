@@ -19,14 +19,16 @@
 #ifndef _libint2_src_lib_libint_engine_h_
 #define _libint2_src_lib_libint_engine_h_
 
-#if __cplusplus <= 199711L
-# error "The simple Libint API requires C++11 support"
+#include <libint2/cxxstd.h>
+#if LIBINT2_CPLUSPLUS_STD < 2011
+# error "libint2/engine.h requires C++11 support"
 #endif
 
 #include <iostream>
 #include <array>
 #include <vector>
 #include <map>
+#include <memory>
 
 #include <libint2.h>
 #include <libint2/boys.h>
@@ -67,7 +69,7 @@ namespace libint2 {
 
   constexpr size_t num_geometrical_derivatives(size_t ncenter,
                                                size_t deriv_order) {
-    return (deriv_order > 0) ? num_geometrical_derivatives(ncenter, deriv_order-1) * (3*ncenter+deriv_order)/deriv_order : 1;
+    return (deriv_order > 0) ? (num_geometrical_derivatives(ncenter, deriv_order-1) * (3*ncenter+deriv_order-1))/deriv_order : 1;
   }
 
 #if defined(LIBINT2_SUPPORT_ONEBODY)
@@ -122,13 +124,13 @@ namespace libint2 {
 
 
       /// creates a default (unusable) OneBodyEngine; to be used as placeholder for copying a usable engine
-      OneBodyEngine() : type_(_invalid), primdata_(), lmax_(-1) {}
+      OneBodyEngine() : type_(_invalid), primdata_(), stack_size_(0), lmax_(-1) {}
 
       /// Constructs a (usable) OneBodyEngine
 
       /// \param max_nprim the maximum number of primitives per contracted Gaussian shell
       /// \param max_l the maximum angular momentum of Gaussian shell
-      /// \param deriv_level if not 0, will compute geometric derivatives of Gaussian integrals of order \c deriv_level
+      /// \param deriv_order if not 0, will compute geometric derivatives of Gaussian integrals of order \c deriv_order
       /// \param params a value of type OneBodyEngine::operator_traits<type>::oper_params_type specifying the parameters of
       ///               the operator set, e.g. position and magnitude of the charges creating the Coulomb potential
       ///               for type == nuclear. For most values of type this is not needed.
@@ -145,18 +147,32 @@ namespace libint2 {
         lmax_(max_l),
         deriv_order_(deriv_order),
         params_(enforce_params_type(type,params)),
-        fm_eval_(type == nuclear ? coulomb_core_eval_t::instance(2*max_l+deriv_order, 1e-25) : 0)
+        fm_eval_(type == nuclear ? coulomb_core_eval_t::instance(2*max_l+deriv_order, 1e-25) : decltype(fm_eval_){})
       {
         initialize();
       }
 
-      /// move constructor is default
-      OneBodyEngine(OneBodyEngine&& other) = default;
+      /// move constructor
+      // intel does not accept "move ctor = default"
+      OneBodyEngine(OneBodyEngine&& other) :
+        type_(other.type_),
+        primdata_(std::move(other.primdata_)),
+        stack_size_(other.stack_size_),
+        lmax_(other.lmax_),
+        hard_lmax_(other.hard_lmax_),
+        deriv_order_(other.deriv_order_),
+        params_(std::move(other.params_)),
+        fm_eval_(std::move(other.fm_eval_)),
+        scratch_(std::move(other.scratch_)),
+        scratch2_(other.scratch2_),
+        buildfnptrs_(other.buildfnptrs_) {
+      }
 
       /// (deep) copy constructor
       OneBodyEngine(const OneBodyEngine& other) :
         type_(other.type_),
         primdata_(other.primdata_.size()),
+        stack_size_(other.stack_size_),
         lmax_(other.lmax_),
         deriv_order_(other.deriv_order_),
         params_(other.params_),
@@ -169,12 +185,26 @@ namespace libint2 {
       }
 
       /// move assignment is default
-      OneBodyEngine& operator=(OneBodyEngine&& other) = default;
+      OneBodyEngine& operator=(OneBodyEngine&& other) {
+        type_ = other.type_;
+        primdata_ = std::move(other.primdata_);
+        stack_size_ = other.stack_size_;
+        lmax_ = other.lmax_;
+        hard_lmax_ = other.hard_lmax_;
+        deriv_order_ = other.deriv_order_;
+        params_ = std::move(other.params_);
+        fm_eval_ = std::move(other.fm_eval_);
+        scratch_ = std::move(other.scratch_);
+        scratch2_ = other.scratch2_;
+        buildfnptrs_ = other.buildfnptrs_;
+        return *this;
+      }
 
       /// (deep) copy assignment
       OneBodyEngine& operator=(const OneBodyEngine& other) {
         type_ = other.type_;
         primdata_.resize(other.primdata_.size());
+        stack_size_ = other.stack_size_;
         lmax_ = other.lmax_;
         deriv_order_ = other.deriv_order_;
         params_ = other.params_;
@@ -188,6 +218,7 @@ namespace libint2 {
       template <typename Params>
       void set_params(const Params& params) {
         params_ = params;
+        reset_scratch();
       }
       /// alias to set_params() for backward compatibility with pre-05/13/2015 code
       /// \deprecated use set_params() instead
@@ -201,7 +232,32 @@ namespace libint2 {
       /// on the operator set. \sa compute()
       /// \note need to specialize for some operator types
       unsigned int nshellsets() const {
-        return nopers() * num_geometrical_derivatives(2,deriv_order_);
+        const unsigned int num_operator_geometrical_derivatives = (type_ == nuclear) ? this->nparams() : 0;
+        const auto ncenters = 2 + num_operator_geometrical_derivatives;
+        return nopers() * num_geometrical_derivatives(ncenters,deriv_order_);
+      }
+
+      /// Given the Cartesian geometric derivative index that refers to center set
+      /// (0...n-1) with one center omitted compute the derivative index referring
+      /// to the full center set
+      /// \param deriv_idx index of the derivative referring to the set with center \c omitted_center omitted
+      /// \param deriv_order order of the geometric derivative
+      /// \param ncenters number of centers in the full set
+      /// \param omitted_center the omitted center, must be less than \c ncenters.
+      /// \return the index of the derivative referring to full set
+      static unsigned int to_target_deriv_index(unsigned int deriv_idx,
+                                                unsigned int deriv_order,
+                                                unsigned int ncenters,
+                                                unsigned int omitted_center) {
+        auto ncenters_reduced = ncenters - 1;
+        auto nderiv_1d = 3 * ncenters_reduced;
+        assert(deriv_idx < num_geometrical_derivatives(ncenters_reduced,deriv_order));
+        switch (deriv_order) {
+          case 1: return deriv_idx >= omitted_center*3 ? deriv_idx+3 : deriv_idx;
+          default: assert(deriv_order<=1); // not implemented, won't be needed when Libint computes all derivatives
+        }
+        assert(false); // unreachable
+        return 0;
       }
 
       /// computes shell set of integrals
@@ -211,8 +267,6 @@ namespace libint2 {
 
         // can only handle 1 contraction at a time
         assert(s1.ncontr() == 1 && s2.ncontr() == 1);
-        // derivatives not supported for now
-        assert(deriv_order_ == 0);
 
         const auto l1 = s1.contr[0].l;
         const auto l2 = s2.contr[0].l;
@@ -227,6 +281,9 @@ namespace libint2 {
         const auto ncart1 = s1.cartesian_size();
         const auto ncart2 = s2.cartesian_size();
         const auto ncart12 = ncart1 * ncart2;
+        const auto nops = nopers();
+
+        const auto tform_to_solids = s1.contr[0].pure || s2.contr[0].pure;
 
         // assert # of primitive pairs
         const auto nprim1 = s1.nprim();
@@ -234,20 +291,40 @@ namespace libint2 {
         const auto nprimpairs = nprim1 * nprim2;
         assert(nprimpairs <= primdata_.size());
 
-        // how many shell sets will I get?
-        auto num_shellsets = nshellsets();
-
-        // Coulomb ints are computed 1 charge at a time, contributions are accumulated in scratch_ (unless la==lb==0)
-        const bool accumulate_ints_in_scratch = (type_ == nuclear);
         auto nparam_sets = nparams();
+
+        // how many shell sets will be returned?
+        auto num_shellsets = nshellsets();
+        // Libint computes derivatives with respect to one center fewer, will use translational invariance to recover
+        const auto geometry_independent_operator = type_ == overlap || type_ == kinetic;
+        const auto num_deriv_centers_computed = geometry_independent_operator ? 1 : 2;
+        auto num_shellsets_computed = nopers() *
+                                      num_geometrical_derivatives(num_deriv_centers_computed,
+                                                                  deriv_order_);
+        // size of ints block computed by Libint
+        const auto target_buf_size = num_shellsets_computed * ncart12;
+
+        // will use scratch_ if:
+        // - Coulomb ints are computed 1 charge at a time, contributions are accumulated in scratch_ (unless la==lb==0)
+        // - derivatives on the missing center need to be reconstructed (no need to accumulate into scratch though)
+        // will only use scratch to accumulate ints when
+        const auto accumulate_ints_in_scratch = (type_ == nuclear);
 
         // adjust max angular momentum, if needed
         const auto lmax = std::max(l1, l2);
         assert (lmax <= lmax_);
-        if (lmax == 0) // (s|s) ints will be accumulated in the first element of stack
+
+        // where cartesian ints are located varies, sometimes we compute them in scratch, etc.
+        // this is the most likely location
+        auto cartesian_ints = primdata_[0].stack;
+
+        // simple (s|s) ints will be computed directly and accumulated in the first element of stack
+        const auto compute_directly = lmax == 0 && deriv_order_ == 0 && (type_ == overlap || type_ == nuclear);
+        if (compute_directly) {
           primdata_[0].stack[0] = 0;
+        }
         else if (accumulate_ints_in_scratch)
-          memset(static_cast<void*>(&scratch_[0]), 0, sizeof(real_t)*ncart12);
+          memset(static_cast<void*>(&scratch_[0]), 0, sizeof(real_t)*target_buf_size);
 
         // loop over accumulation batches
         for(auto pset=0u; pset!=nparam_sets; ++pset) {
@@ -262,8 +339,8 @@ namespace libint2 {
           }
           primdata_[0].contrdepth = p12;
 
-          if (lmax == 0 && (type_ == overlap || type_ == nuclear)) { // (s|s) or (s|V|s)
-            auto& result = primdata_[0].stack[0];
+          if (compute_directly) {
+            auto& result = cartesian_ints[0];
             switch (type_) {
               case overlap:
                 for(auto p12=0; p12 != primdata_[0].contrdepth; ++p12)
@@ -278,40 +355,61 @@ namespace libint2 {
               default:
                 assert(false);
             }
-            primdata_[0].targets[0] = primdata_[0].stack;
+            primdata_[0].targets[0] = cartesian_ints;
           }
           else {
 
-            switch (type_) {
+            buildfnptrs_[s1.contr[0].l*hard_lmax_ + s2.contr[0].l](&primdata_[0]);
+            cartesian_ints = primdata_[0].targets[0];
 
-#define BOOST_PP_ONEBODYENGINE_MCR1(r,data,i,elem)                                                           \
-              case i :                                                                                       \
-                LIBINT2_PREFIXED_NAME( BOOST_PP_CAT(libint2_build_ , elem) )[s1.contr[0].l][s2.contr[0].l](&primdata_[0]); \
-              break;
-
-BOOST_PP_LIST_FOR_EACH_I ( BOOST_PP_ONEBODYENGINE_MCR1, _, BOOST_PP_ONEBODY_OPERATOR_LIST)
-
-              default:
-                assert(false);
-            }
             if (accumulate_ints_in_scratch) {
-              const auto target_buf_size = num_shellsets * ncart12;
+              cartesian_ints = &scratch_[0];
               std::transform(primdata_[0].targets[0], primdata_[0].targets[0] + target_buf_size,
                              &scratch_[0],
                              &scratch_[0], std::plus<real_t>());
+
+              // need to reconstruct derivatives of nuclear ints for each nucleus
+              if (deriv_order_ > 0){
+                const auto nints_per_center = target_buf_size/2;
+                // first two blocks are derivatives with respect to Gaussian positions
+                // rest are derivs with respect to nuclear coordinates
+                auto dest = &scratch_[0] + (2+pset)*nints_per_center;
+                auto src = primdata_[0].targets[0];
+                for(auto i=0; i!=nints_per_center; ++i) {
+                  dest[i] = -src[i];
+                }
+                src = primdata_[0].targets[0] + nints_per_center;
+                for(auto i=0; i!=nints_per_center; ++i) {
+                  dest[i] -= src[i];
+                }
+                num_shellsets_computed+=3; // we just added 3 shell sets
+              } // reconstruct derivatives
+
             }
           } // ltot != 0
 
         } // pset (accumulation batches)
 
-        auto cartesian_ints = (accumulate_ints_in_scratch && lmax != 0) ? &scratch_[0] : primdata_[0].targets[0];
-        auto result = cartesian_ints;
-
-        if (s1.contr[0].pure || s2.contr[0].pure) {
-          auto* spherical_ints = (cartesian_ints == &scratch_[0]) ? primdata_[0].targets[0] : &scratch_[0];
+        auto result = cartesian_ints; // will be adjusted as we proceed
+        if (tform_to_solids) {
+          // where do spherical ints go?
+          auto* spherical_ints = (cartesian_ints == &scratch_[0]) ? scratch2_ : &scratch_[0];
           result = spherical_ints;
 
-          for(unsigned int s=0; s!=num_shellsets; ++s, cartesian_ints+=ncart12, spherical_ints+=n12) {
+          // transform to solid harmonics, one shell set at a time:
+          // for each computed shell set ...
+          for(auto s=0ul; s!=num_shellsets_computed; ++s, cartesian_ints+=ncart12) {
+            // ... find its index in the target shell set:
+            // 1. if regular ints do nothing
+            // 2. for derivatives the target set includes derivatives w.r.t omitted centers,
+            //    to be computed later (for all ints) or already computed (for nuclear);
+            //    in the former case the "omitted" set of derivatives always comes at the end
+            //    hence the index of the current shell set does not change (for 2-body ints
+            //    the rules are different, but Libint will eliminate the need to reconstruct via
+            //    translational invariance soon, so this logic will be unnecessary).
+            auto s_target = s;
+            // .. and compute the destination
+            spherical_ints = result + n12 * s_target;
             if (s1.contr[0].pure && s2.contr[0].pure) {
               libint2::solidharmonics::tform(l1, l2, cartesian_ints, spherical_ints);
             }
@@ -321,9 +419,36 @@ BOOST_PP_LIST_FOR_EACH_I ( BOOST_PP_ONEBODYENGINE_MCR1, _, BOOST_PP_ONEBODY_OPER
               else
                 libint2::solidharmonics::tform_cols(n1, l2, cartesian_ints, spherical_ints);
             }
-          } // loop over shell sets
+          } // loop cartesian shell set
 
         } // tform to solids
+
+        // if computing derivatives of ints of geometry-independent operators
+        // compute the omitted derivatives using translational invariance
+        if (deriv_order_ > 0 && geometry_independent_operator) {
+          assert(deriv_order_ == 1); // assuming 1st-order derivs here, arbitrary order later
+
+          const auto nints_computed = n12*num_shellsets_computed; // target # of ints is twice this
+
+          // make sure there is enough room left in libint stack
+          // if not, copy into scratch2_
+          if (not tform_to_solids) {
+            const auto stack_size_remaining = stack_size_ - (result-primdata_[0].stack) - nints_computed;
+            const auto copy_to_scratch2 = stack_size_remaining < nints_computed;
+            if (copy_to_scratch2) {
+              // this is tricky ... copy does not allow scratch2_ in [result, result + nints_computed)
+              // but this would only happen in scratch2_ == result, but definition of scratch2_ ensures this
+              std::copy(result, result + nints_computed, scratch2_);
+              result = scratch2_;
+            }
+          }
+
+          const auto src = result;
+          const auto dest = result + nints_computed;
+          for(auto f=0ul; f!=nints_computed; ++f) {
+            dest[f] = -src[f];
+          }
+        } // rebuild omitted derivatives of Cartesian ints
 
         return result;
       }
@@ -336,16 +461,34 @@ BOOST_PP_LIST_FOR_EACH_I ( BOOST_PP_ONEBODYENGINE_MCR1, _, BOOST_PP_ONEBODY_OPER
     private:
       operator_type type_;
       std::vector<Libint_t> primdata_;
+      size_t stack_size_;  // amount allocated by libint2_init_xxx in primdata_[0].stack
       int lmax_;
+      int hard_lmax_;      // max L supported by library for this operator type + 1
       size_t deriv_order_;
       any params_;
       std::shared_ptr<coulomb_core_eval_t> fm_eval_; // this is for Coulomb only
       std::vector<real_t> scratch_; // for transposes and/or transforming to solid harmonics
+      real_t* scratch2_;            // &scratch_[0] points to the first block large enough to hold all target ints
+                                    // scratch2_ points to second such block. It could point into scratch_ or at primdata_[0].stack
+      typedef void (*buildfnptr_t)(const Libint_t*);
+      buildfnptr_t* buildfnptrs_;
+
+      void reset_scratch() {
+        const auto ncart_max = (lmax_+1)*(lmax_+2)/2;
+        const auto target_shellset_size = nshellsets() * ncart_max * ncart_max;
+        // need to be able to hold 2 sets of target shellsets: the worst case occurs when dealing with
+        // 1-body Coulomb ints derivatives ... have 2+natom derivative sets that are stored in scratch
+        // then need to transform to solids. To avoid copying back and forth make sure that there is enough
+        // room to transform all ints and save them in correct order in single pass
+        const auto need_extra_large_scratch = stack_size_ < target_shellset_size;
+        scratch_.resize(need_extra_large_scratch ? 2*target_shellset_size : target_shellset_size);
+        scratch2_ = need_extra_large_scratch ? &scratch_[target_shellset_size] : primdata_[0].stack;
+      }
 
       void initialize() {
-        const auto ncart_max = (lmax_+1)*(lmax_+2)/2;
+        assert(deriv_order_ <= LIBINT2_DERIV_ONEBODY_ORDER);
 
-        scratch_.resize(nshellsets() * ncart_max * ncart_max);
+        reset_scratch();
 
 #define BOOST_PP_ONEBODYENGINE_MCR2(r,product)                                                                \
          if (type_ == BOOST_PP_TUPLE_ELEM(2,0,product) && deriv_order_ == BOOST_PP_TUPLE_ELEM(2,1,product) ) {\
@@ -353,6 +496,17 @@ BOOST_PP_LIST_FOR_EACH_I ( BOOST_PP_ONEBODYENGINE_MCR1, _, BOOST_PP_ONEBODY_OPER
                                         BOOST_PP_LIST_AT(BOOST_PP_ONEBODY_OPERATOR_LIST,                      \
                                                          BOOST_PP_TUPLE_ELEM(2,0,product) )                   \
                                        ) );                                                                   \
+           stack_size_ =                                                                                      \
+           LIBINT2_PREFIXED_NAME( BOOST_PP_CAT(                                                               \
+                                    BOOST_PP_CAT(libint2_need_memory_ ,                                       \
+                                      BOOST_PP_LIST_AT(BOOST_PP_ONEBODY_OPERATOR_LIST,                        \
+                                                       BOOST_PP_TUPLE_ELEM(2,0,product) )                     \
+                                    ),                                                                        \
+                                    BOOST_PP_IIF( BOOST_PP_GREATER(BOOST_PP_TUPLE_ELEM(2,1,product),0),       \
+                                                  BOOST_PP_TUPLE_ELEM(2,1,product), BOOST_PP_EMPTY()          \
+                                                )                                                             \
+                                  )                                                                           \
+                                 )(lmax_);                                                                    \
            LIBINT2_PREFIXED_NAME( BOOST_PP_CAT(                                                               \
                                     BOOST_PP_CAT(libint2_init_ ,                                              \
                                       BOOST_PP_LIST_AT(BOOST_PP_ONEBODY_OPERATOR_LIST,                        \
@@ -363,6 +517,27 @@ BOOST_PP_LIST_FOR_EACH_I ( BOOST_PP_ONEBODYENGINE_MCR1, _, BOOST_PP_ONEBODY_OPER
                                                 )                                                             \
                                   )                                                                           \
                                 )(&primdata_[0], lmax_, 0);                                                   \
+           buildfnptrs_ = &                                                                                   \
+           LIBINT2_PREFIXED_NAME( BOOST_PP_CAT(                                                               \
+                                    BOOST_PP_CAT(libint2_build_ ,                                             \
+                                      BOOST_PP_LIST_AT(BOOST_PP_ONEBODY_OPERATOR_LIST,                        \
+                                                       BOOST_PP_TUPLE_ELEM(2,0,product) )                     \
+                                    ),                                                                        \
+                                    BOOST_PP_IIF( BOOST_PP_GREATER(BOOST_PP_TUPLE_ELEM(2,1,product),0),       \
+                                                  BOOST_PP_TUPLE_ELEM(2,1,product), BOOST_PP_EMPTY()          \
+                                                )                                                             \
+                                  )                                                                           \
+                                )[0][0];                                                                      \
+           hard_lmax_ =           BOOST_PP_CAT(                                                               \
+                                    LIBINT2_MAX_AM_ ,                                                         \
+                                    BOOST_PP_CAT(                                                             \
+                                      BOOST_PP_LIST_AT(BOOST_PP_ONEBODY_OPERATOR_LIST,                        \
+                                                       BOOST_PP_TUPLE_ELEM(2,0,product) ),                    \
+                                      BOOST_PP_IIF( BOOST_PP_GREATER(BOOST_PP_TUPLE_ELEM(2,1,product),0),     \
+                                                    BOOST_PP_TUPLE_ELEM(2,1,product), BOOST_PP_EMPTY()        \
+                                                )                                                             \
+                                    )                                                                         \
+                                  ) + 1;                                                                      \
            return;                                                                                            \
          }
 
@@ -423,7 +598,7 @@ BOOST_PP_LIST_FOR_EACH_PRODUCT ( BOOST_PP_ONEBODYENGINE_MCR3, 2, (BOOST_PP_ONEBO
   template <> struct OneBodyEngine::operator_traits<OneBodyEngine::emultipole1> {
       /// Cartesian coordinates of the origin with respect to which the dipole moment is defined
       typedef std::array<double, 3> oper_params_type;
-      static oper_params_type default_params() { return oper_params_type{0.0,0.0,0.0}; }
+      static oper_params_type default_params() { return oper_params_type{{0.0,0.0,0.0}}; }
       static constexpr unsigned int nopers = 4; //!< overlap + 3 dipole components
   };
   template <> struct OneBodyEngine::operator_traits<OneBodyEngine::emultipole2> {
@@ -498,7 +673,8 @@ BOOST_PP_LIST_FOR_EACH_I ( BOOST_PP_ONEBODYENGINE_MCR5, _, BOOST_PP_ONEBODY_OPER
 
     const auto gammap = alpha1 + alpha2;
     const auto oogammap = 1.0 / gammap;
-    const auto rhop = alpha1 * alpha2 * oogammap;
+    const auto rhop_over_alpha1 = alpha2 * oogammap;
+    const auto rhop = alpha1 * rhop_over_alpha1;
     const auto Px = (alpha1 * A[0] + alpha2 * B[0]) * oogammap;
     const auto Py = (alpha1 * A[1] + alpha2 * B[1]) * oogammap;
     const auto Pz = (alpha1 * A[2] + alpha2 * B[2]) * oogammap;
@@ -579,11 +755,6 @@ BOOST_PP_LIST_FOR_EACH_I ( BOOST_PP_ONEBODYENGINE_MCR5, _, BOOST_PP_ONEBODY_OPER
 
     }
 
-    if (deriv_order_ > 0) {
-      // prefactors for derivative overlap relations
-      assert(false);
-    }
-
     decltype(c1) sqrt_PI(1.77245385090551602729816748334);
     const auto xyz_pfac = sqrt_PI * sqrt(oogammap);
     const auto ovlp_ss_x = exp(- rhop * AB2_x) * xyz_pfac * c1 * c2;
@@ -594,7 +765,7 @@ BOOST_PP_LIST_FOR_EACH_I ( BOOST_PP_ONEBODYENGINE_MCR5, _, BOOST_PP_ONEBODY_OPER
     primdata._0_Overlap_0_y[0] = ovlp_ss_y;
     primdata._0_Overlap_0_z[0] = ovlp_ss_z;
 
-    if (type_ == kinetic) {
+    if (type_ == kinetic || (deriv_order_ > 0)) {
 #if LIBINT2_DEFINED(eri,two_alpha0_bra)
       primdata.two_alpha0_bra[0] = 2.0 * alpha1;
 #endif
@@ -604,20 +775,30 @@ BOOST_PP_LIST_FOR_EACH_I ( BOOST_PP_ONEBODYENGINE_MCR5, _, BOOST_PP_ONEBODY_OPER
     }
 
     if (type_ == nuclear) {
+#if LIBINT2_DEFINED(eri,rho12_over_alpha1) || LIBINT2_DEFINED(eri,rho12_over_alpha2)
+      if (deriv_order_ > 0) {
+#if LIBINT2_DEFINED(eri,rho12_over_alpha1)
+        primdata.rho12_over_alpha1[0] = rhop_over_alpha1;
+#endif
+#if LIBINT2_DEFINED(eri,rho12_over_alpha2)
+        primdata.rho12_over_alpha2[0] = alpha1 * oogammap;
+#endif
+      }
+#endif
 #if LIBINT2_DEFINED(eri,PC_x) && LIBINT2_DEFINED(eri,PC_y) && LIBINT2_DEFINED(eri,PC_z)
       const auto PC2 = primdata.PC_x[0] * primdata.PC_x[0] +
                        primdata.PC_y[0] * primdata.PC_y[0] +
                        primdata.PC_z[0] * primdata.PC_z[0];
       const auto U = gammap * PC2;
-      const auto ltot = s1.contr[0].l + s2.contr[0].l;
+      const auto mmax = s1.contr[0].l + s2.contr[0].l + deriv_order_;
       auto* fm_ptr = &(primdata.LIBINT_T_S_ELECPOT_S(0)[0]);
-      fm_eval_->eval(fm_ptr, U, ltot);
+      fm_eval_->eval(fm_ptr, U, mmax);
 
       decltype(U) two_o_sqrt_PI(1.12837916709551257389615890312);
       const auto q = params_.as<operator_traits<nuclear>::oper_params_type>()[oset].first;
       const auto pfac = - q * sqrt(gammap) * two_o_sqrt_PI * ovlp_ss_x * ovlp_ss_y * ovlp_ss_z;
-      const auto ltot_p1 = ltot + 1;
-      for(auto m=0; m!=ltot_p1; ++m) {
+      const auto m_fence = mmax + 1;
+      for(auto m=0; m!=m_fence; ++m) {
         fm_ptr[m] *= pfac;
       }
 #endif
@@ -630,7 +811,6 @@ BOOST_PP_LIST_FOR_EACH_I ( BOOST_PP_ONEBODYENGINE_MCR5, _, BOOST_PP_ONEBODY_OPER
 #undef BOOST_PP_ONEBODY_OPERATOR_INDEX_LIST
 #undef BOOST_PP_ONEBODY_DERIV_ORDER_TUPLE
 #undef BOOST_PP_ONEBODY_DERIV_ORDER_LIST
-#undef BOOST_PP_ONEBODYENGINE_MCR1
 #undef BOOST_PP_ONEBODYENGINE_MCR2
 #undef BOOST_PP_ONEBODYENGINE_MCR3
 #undef BOOST_PP_ONEBODYENGINE_MCR4
@@ -643,7 +823,8 @@ BOOST_PP_LIST_FOR_EACH_I ( BOOST_PP_ONEBODYENGINE_MCR5, _, BOOST_PP_ONEBODY_OPER
     Coulomb,            //!< \f$ 1/r_{12} \f$
     cGTG,               //!< contracted Gaussian geminal = \f$ \sum_i c_i \exp(- \alpha r_{12}^2) \f$
     cGTG_times_Coulomb, //!< contracted Gaussian geminal times Coulomb
-    DelcGTG_square      //!< (\f$ \nabla \f$ cGTG) \f$ \cdot \f$ (\f$ \nabla \f$ cGTG)
+    DelcGTG_square,     //!< (\f$ \nabla \f$ cGTG) \f$ \cdot \f$ (\f$ \nabla \f$ cGTG)
+    Delta               //!< \f$ \delta\left({\bf r}_1 - {\bf r}_2\right) \f$
   };
 
   /// contracted Gaussian geminal = \f$ \sum_i c_i \exp(- \alpha r_{12}^2) \f$, represented as a vector of
@@ -686,6 +867,20 @@ BOOST_PP_LIST_FOR_EACH_I ( BOOST_PP_ONEBODYENGINE_MCR5, _, BOOST_PP_ONEBODY_OPER
       typedef ContractedGaussianGeminal oper_params_type;
   };
 
+  struct delta_gm_eval {
+      void operator()(double* Gm,
+                      double rho,
+                      double T,
+                      int mmax) {
+        const static auto one_over_two_pi = 1.0 / (2.0 * M_PI);
+        const auto G0 = exp(-T) * rho * one_over_two_pi;
+        std::fill(Gm, Gm+mmax+1, G0);
+      }
+  };
+  template <> struct TwoBodyEngineTraits<Delta> {
+      typedef libint2::GenericGmEval<delta_gm_eval> core_eval_type; // core ints are too trivial to bother
+      typedef struct {} oper_params_type;
+  };
 
 #ifdef LIBINT2_SUPPORT_ERI
   /**
@@ -708,7 +903,7 @@ BOOST_PP_LIST_FOR_EACH_I ( BOOST_PP_ONEBODYENGINE_MCR5, _, BOOST_PP_ONEBODY_OPER
 
       /// \param max_nprim the maximum number of primitives per contracted Gaussian shell
       /// \param max_l the maximum angular momentum of Gaussian shell
-      /// \param deriv_level if not 0, will compute geometric derivatives of Gaussian integrals of order \c deriv_level
+      /// \param deriv_order if not 0, will compute geometric derivatives of Gaussian integrals of order \c deriv_order
       /// \param precision specifies the target precision with which the integrals will be computed; the default is the "epsilon"
       ///        of \c real_t type, given by \c std::numeric_limits<real_t>::epsilon(). The precision
       ///        control is somewhat empirical, hence be conservative. \sa set_precision()
@@ -737,7 +932,16 @@ BOOST_PP_LIST_FOR_EACH_I ( BOOST_PP_ONEBODYENGINE_MCR5, _, BOOST_PP_ONEBODY_OPER
       }
 
       /// move constructor
-      TwoBodyEngine(TwoBodyEngine&& other) = default;
+      // intel does not support "move ctor = default"
+      TwoBodyEngine(TwoBodyEngine&& other) :
+        primdata_(std::move(other.primdata_)),
+        spbra_(std::move(other.spbra_)), spket_(std::move(other.spket_)),
+        lmax_(other.lmax_), deriv_order_(other.deriv_order_),
+        precision_(other.precision_), ln_precision_(other.ln_precision_),
+        core_eval_(std::move(other.core_eval_)),
+        core_ints_params_(std::move(other.core_ints_params_)),
+        scratch_(std::move(other.scratch_)) {
+      }
 
       /// (deep) copy constructor
       TwoBodyEngine(const TwoBodyEngine& other) :
@@ -755,7 +959,18 @@ BOOST_PP_LIST_FOR_EACH_I ( BOOST_PP_ONEBODYENGINE_MCR5, _, BOOST_PP_ONEBODY_OPER
       }
 
       /// move assignment
-      TwoBodyEngine& operator=(TwoBodyEngine&& other) = default;
+      // intel does not support "move asgnmt = default"
+      TwoBodyEngine& operator=(TwoBodyEngine&& other) {
+        primdata_ = std::move(other.primdata_);
+        lmax_ = other.lmax_;
+        deriv_order_ = other.deriv_order_;
+        precision_ = other.precision_;
+        ln_precision_ = other.ln_precision_;
+        core_eval_ = std::move(other.core_eval_);
+        core_ints_params_ = std::move(other.core_ints_params_);
+        scratch_ = std::move(other.scratch_);
+        return *this;
+      }
 
       /// (deep) copy assignment
       TwoBodyEngine& operator=(const TwoBodyEngine& other)
@@ -1146,12 +1361,12 @@ BOOST_PP_LIST_FOR_EACH_I ( BOOST_PP_ONEBODYENGINE_MCR5, _, BOOST_PP_ONEBODY_OPER
       friend struct detail::TwoBodyEngineDispatcher<Kernel>;
 
       void initialize() {
+        assert(lmax_ <= LIBINT2_MAX_AM_ERI);
+        assert(deriv_order_ <= LIBINT2_DERIV_ERI_ORDER);
+	
         const auto ncart_max = (lmax_+1)*(lmax_+2)/2;
         const auto max_shellpair_size = ncart_max * ncart_max;
         const auto max_shellset_size = max_shellpair_size * max_shellpair_size;
-
-        assert(lmax_ <= LIBINT2_MAX_AM_ERI);
-        assert(deriv_order_ <= LIBINT2_DERIV_ONEBODY_ORDER);
 
         switch(deriv_order_) {
 
@@ -1244,6 +1459,16 @@ BOOST_PP_LIST_FOR_EACH_I ( BOOST_PP_ONEBODYENGINE_MCR5, _, BOOST_PP_ONEBODY_OPER
                               real_t T,
                               real_t rho) {
           engine->core_eval_->eval(Gm, rho, T, mmax, engine->core_ints_params_);
+        }
+    };
+    template <>
+    struct TwoBodyEngineDispatcher<Delta> {
+        static void core_eval(TwoBodyEngine<Delta>* engine,
+                              real_t* Gm,
+                              int mmax,
+                              real_t T,
+                              real_t rho) {
+          engine->core_eval_->eval(Gm, rho, T, mmax);
         }
     };
   }

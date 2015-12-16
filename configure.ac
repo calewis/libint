@@ -6,7 +6,7 @@ dnl --------- Begin ---------
 dnl Process this file with autoconf to produce a configure script.
 define([AC_CACHE_LOAD], )dnl for debugging configure.in
 define([AC_CACHE_SAVE], )dnl for debugging configure.in
-AC_PREREQ(2.57)
+AC_PREREQ([2.68])
 AC_INIT([Libint2],[libint_mmm_version],[libint@valeyev.net],[libint2])
 AC_CONFIG_SRCDIR(src/bin/libint/rr.h)
 AC_CONFIG_HEADER(include/libint2/config.h)
@@ -390,7 +390,10 @@ AC_ARG_WITH(eri-opt-am,
 
 if test X$INCLUDE_ERI != Xno; then
   AC_DEFINE_UNQUOTED(INCLUDE_ERI,$INCLUDE_ERI)
-  AC_SUBST(LIBINT_SUPPORTS_ERI,"yes")
+  LIBINT_SUPPORTS_ERI=yes
+  AC_SUBST(LIBINT_SUPPORTS_ERI)
+  LIBINT_ERI_DERIV=$INCLUDE_ERI
+  AC_SUBST(LIBINT_ERI_DERIV)  
 fi
 
 ONEBODY_MAX_AM=$LIBINT_MAX_AM
@@ -442,7 +445,10 @@ AC_ARG_WITH(1body-opt-am,
 
 if test X$INCLUDE_ONEBODY != Xno; then
   AC_DEFINE_UNQUOTED(INCLUDE_ONEBODY,$INCLUDE_ONEBODY)
-  AC_SUBST(LIBINT_SUPPORTS_ONEBODY,"yes")
+  LIBINT_SUPPORTS_ONEBODY=yes
+  AC_SUBST(LIBINT_SUPPORTS_ONEBODY)
+  LIBINT_ONEBODY_DERIV=$INCLUDE_ONEBODY
+  AC_SUBST(LIBINT_ONEBODY_DERIV)
 fi
 
 # check max am for 3-center ERIs, if needed
@@ -1032,6 +1038,7 @@ CXXFLAGS="$initial_CXXFLAGS"
 AC_CHECK_PROG(AR,ar,ar)
 AC_CHECK_PROG(PERL,perl,perl)
 AC_CHECK_PROGS(TAR,gnutar tar,tar)
+AC_CHECK_PROGS(PYTHON,python python3 python2 python2.7,python)
 AC_PATH_PROG(DOXYGEN,doxygen,,$PATH:/usr/local/bin:/opt/local/bin)
 AC_PATH_PROG(PDFLATEX,pdflatex,,$PATH:/usr/local/bin:/opt/local/bin)
 AC_PATH_PROG(PSLATEX,pslatex,,$PATH:/usr/local/bin:/opt/local/bin)
@@ -1045,10 +1052,11 @@ dnl The lack of certain tools is a show stopper
 changequote(<<, >>)dnl
 
 if [ X$PERL = X ]; then
-  echo "Could not find the program perl!"
-  echo "Most system vendors provide it."
-  echo "It can also be obtained at"
-  echo "http://www.perl.org/"
+  echo "Could not find program: perl"
+  exit 1
+fi
+if [ X$PYTHON = X ]; then
+  echo "Could not find program: python"
   exit 1
 fi
 
@@ -1422,7 +1430,7 @@ AC_CONFIG_FILES([src/bin/test_eri/time_eri.pl],[chmod +x src/bin/test_eri/time_e
 AC_CONFIG_FILES([src/bin/test_eri/run_time_eri.pl],[chmod +x src/bin/test_eri/run_time_eri.pl])
 AC_CONFIG_FILES([src/bin/test_eri/stdtests.pl],[chmod +x src/bin/test_eri/stdtests.pl])
 AC_CONFIG_FILES([src/bin/test_eri/run_timing_suite.pl],[chmod +x src/bin/test_eri/run_timing_suite.pl])
-AC_CONFIG_FILES(src/bin/MakeVars src/lib/MakeVars src/lib/MakeRules
+AC_CONFIG_FILES(src/bin/MakeVars src/lib/MakeVars src/lib/MakeRules src/lib/libint/MakeVars.features
                 doc/MakeVars doc/MakeRules doc/progman/macros.tex doc/classdoc/doxygen.cfg
                 include/libint2/cgshell_ordering.h include/libint2/basis.h libint2.pc)
 

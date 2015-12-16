@@ -19,7 +19,8 @@
 #ifndef _libint2_src_lib_libint_solidharmonics_h_
 #define _libint2_src_lib_libint_solidharmonics_h_
 
-#if __cplusplus <= 199711L
+#include <libint2/cxxstd.h>
+#if LIBINT2_CPLUSPLUS_STD < 2011
 # error "The simple Libint API requires C++11 support"
 #endif
 
@@ -55,7 +56,14 @@ namespace libint2 {
           assert(l <= std::numeric_limits<signed char>::max());
           init();
         }
-        SolidHarmonicsCoefficients(SolidHarmonicsCoefficients&& other) = default;
+        // intel does not support "move ctor = default"
+        SolidHarmonicsCoefficients(SolidHarmonicsCoefficients&& other) :
+          values_(std::move(other.values_)),
+          row_offset_(std::move(other.row_offset_)),
+          colidx_(std::move(other.colidx_)),
+          l_(other.l_) {
+        }
+
         SolidHarmonicsCoefficients(const SolidHarmonicsCoefficients& other) = default;
 
         void init(unsigned char l) {
@@ -161,7 +169,11 @@ namespace libint2 {
             return 0.0;
 
           assert(l <= 10); // libint2::math::fac[] is only defined up to 20
-          Real pfac = sqrt(Real(fac[2*lx]*fac[2*ly]*fac[2*lz]*fac[l-abs_m])/(fac[2*l]*fac[l]*fac[lx]*fac[ly]*fac[lz]*fac[l+abs_m]));
+          Real pfac = sqrt( ((Real(fac[2*lx]*fac[2*ly]*fac[2*lz]))/fac[2*l]) *
+                            ((Real(fac[l-abs_m]))/(fac[l])) *
+                            (Real(1)/fac[l+abs_m]) *
+                            (Real(1)/(fac[lx]*fac[ly]*fac[lz]))
+                          );
           /*  pfac = sqrt(fac[l-abs_m]/(fac[l]*fac[l]*fac[l+abs_m]));*/
           pfac /= (1L << l);
           if (m < 0)
@@ -186,10 +198,8 @@ namespace libint2 {
           }
           sum *= sqrt(Real(df_Kminus1[2*l])/(df_Kminus1[2*lx]*df_Kminus1[2*ly]*df_Kminus1[2*lz]));
 
-          if (m == 0)
-            return pfac*sum;
-          else
-            return M_SQRT2*pfac*sum;
+          Real result = (m == 0) ? pfac*sum : M_SQRT2*pfac*sum;
+          return result;
         }
 
         struct CtorHelperIter : public std::iterator<std::input_iterator_tag, SolidHarmonicsCoefficients> {
@@ -199,7 +209,6 @@ namespace libint2 {
             CtorHelperIter() = default;
             CtorHelperIter(unsigned int l) : l_(l) {}
             CtorHelperIter(const CtorHelperIter&) = default;
-            CtorHelperIter(CtorHelperIter&&) = default;
             CtorHelperIter& operator=(const CtorHelperIter& rhs) { l_ = rhs.l_; return *this; }
 
             CtorHelperIter& operator++() { ++l_; return *this; }
