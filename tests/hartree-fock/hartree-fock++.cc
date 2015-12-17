@@ -29,6 +29,7 @@
 #include <atomic>
 #include <iterator>
 #include <unordered_map>
+#include <unordered_set>
 #include <mutex>
 
 // Eigen matrix algebra library
@@ -95,6 +96,10 @@ Matrix compute_do_ints(const BasisSet& bs1,
 using shellpair_list_t = std::unordered_map<size_t,std::vector<size_t>>;
 shellpair_list_t obs_shellpair_list; // shellpair list for OBS
 
+std::vector<double> k_times;
+std::vector<int> j_ints;
+std::vector<int> k_ints;
+
 /// computes non-negligible shell pair list; shells \c i and \c j form a non-negligible
 /// pair if they share a center or the Frobenius norm of their overlap is greater than threshold
 shellpair_list_t
@@ -106,8 +111,10 @@ compute_shellpair_list(const BasisSet& bs1,
 Matrix compute_2body_fock(const BasisSet& obs,
                           const Matrix& D,
                           double precision = std::numeric_limits<double>::epsilon(), // discard contributions smaller than this
-                          const Matrix& Schwartz = Matrix() // K_ij = sqrt(||(ij|ij)||_\infty); if empty, do not Schwartz screen
+                          const Matrix& Schwartz = Matrix(), // K_ij = sqrt(||(ij|ij)||_\infty); if empty, do not Schwartz screen
+                          const bool use_linK = false
                          );
+
 // an Fock builder that can accept densities expressed a separate basis
 Matrix compute_2body_fock_general(const BasisSet& obs,
                                   const Matrix& D,
@@ -178,11 +185,14 @@ int main(int argc, char *argv[]) {
     // read geometry from a file; by default read from h2o.xyz, else take filename (.xyz) from the command line
     const auto filename = (argc > 1) ? argv[1] : "h2o.xyz";
     const auto basisname = (argc > 2) ? argv[2] : "aug-cc-pVDZ";
+    const auto fock_precision = (argc > 3) ? std::stod(argv[3]) : 1e-14;
+    const bool use_linK = (argc > 4) ? std::stoi(argv[4]) : false;
+
+    if(use_linK){
+        std::cout << "Using LinK for exchange!" << std::endl;
+    }
+
     bool do_density_fitting = false;
-#ifdef HAVE_DENSITY_FITTING
-    do_density_fitting = (argc > 3);
-    const auto dfbasisname = do_density_fitting ? argv[3] : "";
-#endif
     std::vector<Atom> atoms = read_geometry(filename);
 
     // set up thread pool
@@ -230,9 +240,9 @@ int main(int argc, char *argv[]) {
 
     libint2::Shell::do_enforce_unit_normalization(false);
 
-    cout << "Atomic Cartesian coordinates (a.u.):" << endl;
-    for(const auto& a: atoms)
-      std::cout << a.atomic_number << " " << a.x << " " << a.y << " " << a.z << std::endl;
+    // cout << "Atomic Cartesian coordinates (a.u.):" << endl;
+    // for(const auto& a: atoms)
+    //   std::cout << a.atomic_number << " " << a.x << " " << a.y << " " << a.z << std::endl;
 
     BasisSet obs(basisname, atoms);
     cout << "orbital basis set rank = " << obs.nbf() << endl;
@@ -315,7 +325,7 @@ int main(int argc, char *argv[]) {
     /***          SCF loop           ***/
     /*** =========================== ***/
 
-    const auto maxiter = 100;
+    const auto maxiter = 40;
     const auto conv = 1e-12;
     auto iter = 0;
     auto rms_error = 1.0;
@@ -329,7 +339,7 @@ int main(int argc, char *argv[]) {
     Matrix F = H;
     bool reset_incremental_fock_formation = false;
     bool incremental_Fbuild_started = false;
-    double start_incremental_F_threshold = 1e-5;
+    double start_incremental_F_threshold = 1e-17;
     double next_reset_threshold = 0.0;
     size_t last_reset_iteration = 0;
     // ... unless doing DF, then use MO coefficients, hence not "incremental"
@@ -363,8 +373,8 @@ int main(int argc, char *argv[]) {
 
       // build a new Fock matrix
       if (not do_density_fitting) {
-        const auto precision_F = std::min(1e-7,std::max(rms_error/1e4,std::numeric_limits<double>::epsilon()));
-        F += compute_2body_fock(obs, D_diff, precision_F, K);
+        const auto precision_F = fock_precision;
+        F += compute_2body_fock(obs, D_diff, precision_F, K, use_linK);
       }
 #if HAVE_DENSITY_FITTING
       else { // do DF
@@ -470,6 +480,21 @@ int main(int argc, char *argv[]) {
 
     printf("** Hartree-Fock energy = %20.12f\n", ehf + enuc);
 
+    auto sum = 0.;
+    for(auto t : k_times){
+        sum += t;
+    }
+    std::cout << "Average K time = " << sum/k_times.size() << std::endl;
+    sum = 0.;
+    for(auto t : j_ints){
+        sum += t;
+    }
+    std::cout << "Average J Integrals = " << sum/j_ints.size() << std::endl;
+    sum = 0.;
+    for(auto t : k_ints){
+        sum += t;
+    }
+    std::cout << "Average K Integrals = " << sum/k_ints.size() << std::endl;
     libint2::cleanup(); // done with libint
 
   } // end of try block; if any exceptions occurred, report them and exit cleanly
@@ -986,7 +1011,7 @@ compute_shellpair_list(const BasisSet& bs1,
 
   libint2::parallel_do(compute);
 
-  // resort shell list in increasing order, i.e. result[s][s1] < result[s][s2] if s1 < s2
+  // resort shell list
   auto sort = [&] (int thread_id) {
     for(auto s1=0l; s1!=nsh1; ++s1) {
       if (s1%nthreads == thread_id) {
@@ -1070,7 +1095,8 @@ Matrix compute_2body_2index_ints(const BasisSet& bs)
 Matrix compute_2body_fock(const BasisSet& obs,
                           const Matrix& D,
                           double precision,
-                          const Matrix& Schwartz) {
+                          const Matrix& Schwartz,
+                          bool use_linK) {
 
   const auto n = obs.nbf();
   const auto nshells = obs.size();
@@ -1094,7 +1120,8 @@ Matrix compute_2body_fock(const BasisSet& obs,
   for(size_t i=1; i!=nthreads; ++i) {
     engines[i] = engines[0];
   }
-  std::atomic<size_t> num_ints_computed{0};
+  std::atomic<size_t> num_j_computed{0};
+  std::atomic<size_t> num_k_computed{0};
 
 #if defined(REPORT_INTEGRAL_TIMINGS)
   std::vector<libint2::Timers<1>> timers(nthreads);
@@ -1102,7 +1129,173 @@ Matrix compute_2body_fock(const BasisSet& obs,
 
   auto shell2bf = obs.shell2bf();
 
-  auto lambda = [&] (int thread_id) {
+  namespace tim = std::chrono;
+  using dur = tim::duration<double>;
+
+  // From 1998 LinK paper Ochsenfeld, White and Head-Gordon
+  // 4 center int is (\mu \lambda | \nu \sigma) 
+  
+
+  Matrix const &Q = Schwartz;
+  Matrix const &Ds = D_shblk_norm;
+
+  // Compute max vals in rows of Q but don't time for now
+  std::vector<double> max_Q(nshells);
+  std::vector<double> max_D(nshells);
+  for(auto i = 0; i < Q.rows(); ++i){
+      max_Q[i] = Q.row(i).lpNorm<Eigen::Infinity>();
+      max_D[i] = D.row(i).lpNorm<Eigen::Infinity>();
+  }
+
+  auto prescreen0 = tim::high_resolution_clock::now();
+
+#if 0 // LinK style loops
+  // Loop over all significant \mu and all significant \nu 
+  for(auto s1 = 0; s1 != nshells; ++s1){
+      for(auto s3=0; s3<=s1; ++s3) {
+          if(Ds(s1, s3) * max_Q[s1] * max_Q[s3] > precision){
+              auto d_nu_bound = Ds(s1,s3) * max_Q[s3];
+              sig_nu_in_mus[s1].push_back(std::make_pair(s3,d_nu_bound));
+          }
+      }
+
+      // Sort \nu by size of D(\mu,\nu) * max_Q[\nu]
+      auto start = sig_nu_in_mus[s1].begin();
+      auto end = sig_nu_in_mus[s1].end();
+      std::sort(start, end, [](std::pair<int, double> const& a,
+                               std::pair<int, double> const b) {
+          // Sort greatest to least
+          return b.second < a.second;
+      });
+  }
+
+  for(auto s1 = 0; s1 != nshells; ++s1){
+      for(auto s2 : obs_shellpair_list[s1]){
+          for(auto s3 = 0; s3 <= s1; ++s3){
+              bool already_have_s3 = false;
+              for(auto const &lpair : sig_nu_in_mus[s1]){
+                  if(s3 == lpair.first){
+                      already_have_s3 = true;
+                      break;
+                  }
+              }
+
+              if (!already_have_s3) {
+                  for (auto const& lpair : sig_nu_in_mus[s2]) {
+                      if (s3 == lpair.first) {
+                          already_have_s3 = true;
+                          break;
+                      }
+                  }
+              }
+
+              if (!already_have_s3) {
+                  const auto s4_max = (s1 == s3) ? s2 : s3;
+                  for (auto s4 : obs_shellpair_list[s3]) {
+                      if (s4 > s4_max) continue;
+                      auto maxd = std::max(
+                          {Ds(s1, s3), Ds(s1, s4), Ds(s2, s3), Ds(s2, s4)});
+                      auto Q12 = Q(s1, s2);
+                      auto Q34 = Q(s3, s4);
+                      auto val = maxd * Q12 * Q34;
+                      if (val > precision) {
+                          std::cout << "For {s1,s2,s3,s4} = {"
+                                    << s1 << "," << s2 << "," << s3 << "," << s4
+                                    << "} with thresh = " << precision << std::endl;
+                          std::cout << "\ts3 in s1: ";
+                          for(auto &lpair : sig_nu_in_mus[s1]){
+                              std::cout << lpair.first << " ";
+                          }
+                          std::cout << std::endl;
+                          std::cout << "\ts3 in s2: ";
+                          for(auto &lpair : sig_nu_in_mus[s2]){
+                              std::cout << lpair.first << " ";
+                          }
+                          std::cout << std::endl;
+                          std::cout << "\tmaxQ(s1) = " << max_Q[s1]
+                                    << std::endl;
+                          std::cout << "\tmaxQ(s3) = " << max_Q[s3]
+                                    << std::endl;
+                          std::cout << "\tmaxD(s1) = " << max_D[s1]
+                                    << std::endl;
+                          std::cout << "\tmaxD(s3) = " << max_D[s3]
+                                    << std::endl;
+                          std::cout << "\tmaxD(s2) = " << max_D[s2]
+                                    << std::endl;
+                          std::cout << "\tmaxD(s4) = " << max_D[s4]
+                                    << std::endl;
+                          std::cout << "\tD(s1,s3) = " << Ds(s1, s3)
+                                    << std::endl;
+                          std::cout << "\tD(s1,s4) = " << Ds(s1, s4)
+                                    << std::endl;
+                          std::cout << "\tD(s2,s3) = " << Ds(s2, s3)
+                                    << std::endl;
+                          std::cout << "\tD(s2,s4) = " << Ds(s2, s4)
+                                    << std::endl;
+                          std::cout << "\tmaxQ(s1) * maxQ(s3) * D(s1,s3) = "
+                                    << max_Q[s1] * max_Q[s3] * Ds(s1, s3)
+                                    << std::endl;
+                          std::cout << "\tmaxQ(s1) * maxQ(s3) * D(s1,s4) = "
+                                    << max_Q[s1] * max_Q[s3] * Ds(s1, s4)
+                                    << std::endl;
+                          std::cout << "\tmaxQ(s1) * maxQ(s3) * D(s2,s3) = "
+                                    << max_Q[s1] * max_Q[s3] * Ds(s2, s3)
+                                    << std::endl;
+                          std::cout << "\tmaxQ(s1) * maxQ(s3) * D(s2,s4) = "
+                                    << max_Q[s1] * max_Q[s3] * Ds(s2, s4)
+                                    << std::endl;
+                      }
+                  }
+              }
+          }
+      }
+  }
+
+  using sorted_shell_pair_list = 
+      std::unordered_map<std::size_t, std::vector<std::pair<int, double>>>;
+
+  sorted_shell_pair_list nu_sig_sorted;
+  for (auto i = 0; i < nshells; ++i) {
+      std::vector<std::pair<int, double>> sign_sig;
+      for (auto const& j : obs_shellpair_list[i]) {
+          sign_sig.push_back(std::make_pair(j, Q(i, j)));
+      }
+      std::sort(
+          sign_sig.begin(), sign_sig.end(),
+          [](std::pair<int, double> const& a, std::pair<int, double> const b) {
+              // Sort greatest to least
+              return b.second < a.second;
+          });
+      nu_sig_sorted[i] = std::move(sign_sig);
+  }
+#endif
+
+#if 1 // Drew's significant s3 for S1 builder
+  // Vector to hold significant \nu for every \mu
+  std::vector<std::unordered_set<int>> sig_nu_in_mus(nshells);
+  for(auto s1 = 0; s1 != nshells; ++s1){
+      for(auto s2 : obs_shellpair_list[s1]){
+          const auto Q12 = Q(s1,s2);
+
+          auto maxD = 0.0;
+          for(auto s3 = 0; s3 <= s1; ++s3){
+              maxD = std::max({maxD, Ds(s1,s3), Ds(s2,s3)});
+              const auto est = Q12 * maxD * max_Q[s3];
+              if(est >= precision){
+                  auto iter = sig_nu_in_mus[s1].find(s3);
+                  if(iter == sig_nu_in_mus[s1].end()){
+                      sig_nu_in_mus[s1].insert(s3);
+                  }
+              }
+          }
+      }
+  }
+#endif
+
+  auto prescreen1 = tim::high_resolution_clock::now();
+  dur pstime = prescreen1 - prescreen0;
+
+  auto lambdaJ = [&] (int thread_id) {
 
     auto& engine = engines[thread_id];
     auto& g = G[thread_id];
@@ -1115,6 +1308,8 @@ Matrix compute_2body_fock(const BasisSet& obs,
 
     // loop over permutationally-unique set of shells
     for(auto s1=0l, s1234=0l; s1!=nshells; ++s1) {
+        if (s1 % nthreads != thread_id)
+          continue;
 
       auto bf1_first = shell2bf[s1]; // first basis function in this shell
       auto n1 = obs[s1].size();// number of basis functions in this shell
@@ -1125,38 +1320,28 @@ Matrix compute_2body_fock(const BasisSet& obs,
         auto n2 = obs[s2].size();
 
         const auto Dnorm12 = do_schwartz_screen ? D_shblk_norm(s1,s2) : 0.;
+        const auto Q12 = do_schwartz_screen ? Q(s1,s2) : 0.;
 
         for(auto s3=0; s3<=s1; ++s3) {
 
           auto bf3_first = shell2bf[s3];
           auto n3 = obs[s3].size();
-
-          const auto Dnorm123 = do_schwartz_screen ? std::max(D_shblk_norm(s1,s3),
-                                                              std::max(D_shblk_norm(s2,s3),Dnorm12)
-                                                             )
-                                                   : 0.;
-
+          
           const auto s4_max = (s1 == s3) ? s2 : s3;
           for(const auto& s4: obs_shellpair_list[s3]) {
             if (s4 > s4_max) break; // for each s3, s4 are stored in monotonically increasing order
 
-            if ((s1234++) % nthreads != thread_id)
-              continue;
+            const auto Qest = Q12 * Q(s3,s4);
+            const auto est12 = Dnorm12 * Qest;
+            const auto est34 = Ds(s3,s4) * Qest;
 
-            const auto Dnorm1234 = do_schwartz_screen ? std::max(D_shblk_norm(s1,s4),
-                                                                 std::max(D_shblk_norm(s2,s4),
-                                                                          std::max(D_shblk_norm(s3,s4),Dnorm123)
-                                                                         )
-                                                                )
-                                                      : 0.;
-
-            if (do_schwartz_screen && Dnorm1234 * Schwartz(s1,s2) * Schwartz(s3,s4) < precision)
+            if (do_schwartz_screen && std::max(est12, est34) < precision)
               continue;
 
             auto bf4_first = shell2bf[s4];
             auto n4 = obs[s4].size();
 
-            num_ints_computed += n1*n2*n3*n4;
+            num_j_computed += n1*n2*n3*n4;
 
             // compute the permutational degeneracy (i.e. # of equivalents) of the given shell set
             auto s12_deg = (s1 == s2) ? 1.0 : 2.0;
@@ -1177,10 +1362,6 @@ Matrix compute_2body_fock(const BasisSet& obs,
             // 1) each shell set of integrals contributes up to 6 shell sets of the Fock matrix:
             //    F(a,b) += (ab|cd) * D(c,d)
             //    F(c,d) += (ab|cd) * D(a,b)
-            //    F(b,d) -= 1/4 * (ab|cd) * D(a,c)
-            //    F(b,c) -= 1/4 * (ab|cd) * D(a,d)
-            //    F(a,c) -= 1/4 * (ab|cd) * D(b,d)
-            //    F(a,d) -= 1/4 * (ab|cd) * D(b,c)
             // 2) each permutationally-unique integral (shell set) must be scaled by its degeneracy,
             //    i.e. the number of the integrals/sets equivalent to it
             // 3) the end result must be symmetrized
@@ -1199,10 +1380,6 @@ Matrix compute_2body_fock(const BasisSet& obs,
 
                     g(bf1,bf2) += D(bf3,bf4) * value_scal_by_deg;
                     g(bf3,bf4) += D(bf1,bf2) * value_scal_by_deg;
-                    g(bf1,bf3) -= 0.25 * D(bf2,bf4) * value_scal_by_deg;
-                    g(bf2,bf4) -= 0.25 * D(bf1,bf3) * value_scal_by_deg;
-                    g(bf1,bf4) -= 0.25 * D(bf2,bf3) * value_scal_by_deg;
-                    g(bf2,bf3) -= 0.25 * D(bf1,bf4) * value_scal_by_deg;
                   }
                 }
               }
@@ -1215,7 +1392,376 @@ Matrix compute_2body_fock(const BasisSet& obs,
 
   }; // end of lambda
 
-  libint2::parallel_do(lambda);
+    
+
+  auto lambdaK = [&](int thread_id) {
+
+      auto& engine = engines[thread_id];
+      auto& g = G[thread_id];
+
+#if defined(REPORT_INTEGRAL_TIMINGS)
+      auto& timer = timers[thread_id];
+      timer.clear();
+      timer.set_now_overhead(25);
+#endif
+      if (use_linK) {
+#if 0 // LinK style looping
+          // significant \nu \sigma for \mu and \lambda
+          std::vector<std::pair<int, int>> sig_kets;
+          for (auto s1 = 0l, s1234 = 0l; s1 != nshells; ++s1) {
+              if (s1 % nthreads != thread_id) continue;
+              auto bf1_first = shell2bf[s1];
+              auto n1 = obs[s1].size();
+
+              for (const auto& s2 : obs_shellpair_list[s1]) {
+                  auto bf2_first = shell2bf[s2];
+                  auto n2 = obs[s2].size();
+
+                  const auto Q12 = Q(s1, s2);
+                  sig_kets.resize(0);
+
+                  for (auto const& nu : sig_nu_in_mus[s1]) {
+                      const auto s3 = nu.first;
+
+                      const auto D13 = Ds(s1, s3);
+                      const auto D23 = Ds(s2, s3);
+
+                      auto at_least_one_sig = false;
+                      const auto s4_max = (s1 == s3) ? s2 : s3;
+
+                      for (const auto& idx_val : nu_sig_sorted[s3]) {
+                          const auto s4 = idx_val.first;
+                          if (s4 > s4_max) continue;
+
+                          auto dmax =
+                              std::max({D13, Ds(s1, s4), D23, Ds(s2, s4)});
+
+                          if (dmax * Q12 * Q(s3, s4) > precision) {
+                              sig_kets.push_back(std::make_pair(s3, s4));
+                              at_least_one_sig = true;
+                          } else {
+                              break;
+                          }
+                      }
+
+                      // Leave loop if we added 0 \sigmas
+                      if (!at_least_one_sig) {
+                          break;
+                      }
+                  }
+
+                  for (auto const &sig_ket : sig_kets) {
+                      const auto s3 = sig_ket.first;
+                      const auto s4 = sig_ket.second;
+
+                      auto bf3_first = shell2bf[s3];
+                      auto n3 = obs[s3].size();
+
+                      auto bf4_first = shell2bf[s4];
+                      auto n4 = obs[s4].size();
+
+                      num_k_computed += n1 * n2 * n3 * n4;
+
+                      // compute the permutational degeneracy (i.e. # of
+                      // equivalents)
+                      // of the given shell set
+                      auto s12_deg = (s1 == s2) ? 1.0 : 2.0;
+                      auto s34_deg = (s3 == s4) ? 1.0 : 2.0;
+                      auto s12_34_deg =
+                          (s1 == s3) ? (s2 == s4 ? 1.0 : 2.0) : 2.0;
+                      auto s1234_deg = s12_deg * s34_deg * s12_34_deg;
+
+#if defined(REPORT_INTEGRAL_TIMINGS)
+                      timer.start(0);
+#endif
+
+                      const auto* buf =
+                          engine.compute(obs[s1], obs[s2], obs[s3], obs[s4]);
+
+#if defined(REPORT_INTEGRAL_TIMINGS)
+                      timer.stop(0);
+#endif
+
+                      // 1) each shell set of integrals contributes up to 6
+                      // shell
+                      // sets
+                      // of the Fock matrix:
+                      //    F(b,d) -= 1/4 * (ab|cd) * D(a,c)
+                      //    F(b,c) -= 1/4 * (ab|cd) * D(a,d)
+                      //    F(a,c) -= 1/4 * (ab|cd) * D(b,d)
+                      //    F(a,d) -= 1/4 * (ab|cd) * D(b,c)
+                      // 2) each permutationally-unique integral (shell set)
+                      // must be
+                      // scaled by its degeneracy,
+                      //    i.e. the number of the integrals/sets equivalent to
+                      //    it
+                      // 3) the end result must be symmetrized
+                      for (auto f1 = 0, f1234 = 0; f1 != n1; ++f1) {
+                          const auto bf1 = f1 + bf1_first;
+                          for (auto f2 = 0; f2 != n2; ++f2) {
+                              const auto bf2 = f2 + bf2_first;
+                              for (auto f3 = 0; f3 != n3; ++f3) {
+                                  const auto bf3 = f3 + bf3_first;
+                                  for (auto f4 = 0; f4 != n4; ++f4, ++f1234) {
+                                      const auto bf4 = f4 + bf4_first;
+
+                                      const auto value = buf[f1234];
+
+                                      const auto value_scal_by_deg =
+                                          value * s1234_deg;
+
+                                      g(bf1, bf3) -= 0.25 * D(bf2, bf4) *
+                                                     value_scal_by_deg;
+                                      g(bf2, bf4) -= 0.25 * D(bf1, bf3) *
+                                                     value_scal_by_deg;
+                                      g(bf1, bf4) -= 0.25 * D(bf2, bf3) *
+                                                     value_scal_by_deg;
+                                      g(bf2, bf3) -= 0.25 * D(bf1, bf4) *
+                                                     value_scal_by_deg;
+                                  }
+                              }
+                          }
+                      }
+                  }
+              }
+          }
+#endif // LinK style looping
+          for (auto s1 = 0l, s1234 = 0l; s1 != nshells; ++s1) {
+              if (s1 % nthreads != thread_id) continue;
+
+              auto bf1_first = shell2bf[s1];
+              auto n1 = obs[s1].size();  
+
+              for (const auto& s2 : obs_shellpair_list[s1]) {
+                  auto bf2_first = shell2bf[s2];
+                  auto n2 = obs[s2].size();
+
+                  for (auto s3 : sig_nu_in_mus[s1]) {
+                      auto bf3_first = shell2bf[s3];
+                      auto n3 = obs[s3].size();
+
+                      const auto s4_max = (s1 == s3) ? s2 : s3;
+                      for (const auto& s4 : obs_shellpair_list[s3]) {
+                          if (s4 > s4_max) break;
+
+                          const auto Dnorm1234 =
+                              do_schwartz_screen
+                                  ? std::max({Ds(s1, s4), Ds(s1, s3),
+                                              Ds(s2, s3), Ds(s2, s4)})
+                                  : 0.;
+
+                          if (do_schwartz_screen &&
+                              Dnorm1234 * Schwartz(s1,s2) * Schwartz(s3, s4) < precision)
+                              continue;
+
+                          auto bf4_first = shell2bf[s4];
+                          auto n4 = obs[s4].size();
+
+                          num_k_computed += n1 * n2 * n3 * n4;
+
+                          // compute the permutational degeneracy (i.e. # of
+                          // equivalents) of the given shell set
+                          auto s12_deg = (s1 == s2) ? 1.0 : 2.0;
+                          auto s34_deg = (s3 == s4) ? 1.0 : 2.0;
+                          auto s12_34_deg =
+                              (s1 == s3) ? (s2 == s4 ? 1.0 : 2.0) : 2.0;
+                          auto s1234_deg = s12_deg * s34_deg * s12_34_deg;
+
+#if defined(REPORT_INTEGRAL_TIMINGS)
+                          timer.start(0);
+#endif
+
+                          const auto* buf = engine.compute(obs[s1], obs[s2],
+                                                           obs[s3], obs[s4]);
+
+#if defined(REPORT_INTEGRAL_TIMINGS)
+                          timer.stop(0);
+#endif
+
+                          // 1) each shell set of integrals contributes up to 6
+                          // shell sets of the Fock matrix:
+                          //    F(a,b) += (ab|cd) * D(c,d)
+                          //    F(c,d) += (ab|cd) * D(a,b)
+                          //    F(b,d) -= 1/4 * (ab|cd) * D(a,c)
+                          //    F(b,c) -= 1/4 * (ab|cd) * D(a,d)
+                          //    F(a,c) -= 1/4 * (ab|cd) * D(b,d)
+                          //    F(a,d) -= 1/4 * (ab|cd) * D(b,c)
+                          // 2) each permutationally-unique integral (shell set)
+                          // must be scaled by its degeneracy,
+                          //    i.e. the number of the integrals/sets equivalent
+                          //    to it
+                          // 3) the end result must be symmetrized
+                          for (auto f1 = 0, f1234 = 0; f1 != n1; ++f1) {
+                              const auto bf1 = f1 + bf1_first;
+                              for (auto f2 = 0; f2 != n2; ++f2) {
+                                  const auto bf2 = f2 + bf2_first;
+                                  for (auto f3 = 0; f3 != n3; ++f3) {
+                                      const auto bf3 = f3 + bf3_first;
+                                      for (auto f4 = 0; f4 != n4;
+                                           ++f4, ++f1234) {
+                                          const auto bf4 = f4 + bf4_first;
+
+                                          const auto value = buf[f1234];
+
+                                          const auto value_scal_by_deg =
+                                              value * s1234_deg;
+
+                                          // g(bf1,bf2) += D(bf3,bf4) *
+                                          // value_scal_by_deg;
+                                          // g(bf3,bf4) += D(bf1,bf2) *
+                                          // value_scal_by_deg;
+                                          g(bf1, bf3) -= 0.25 * D(bf2, bf4) *
+                                                         value_scal_by_deg;
+                                          g(bf2, bf4) -= 0.25 * D(bf1, bf3) *
+                                                         value_scal_by_deg;
+                                          g(bf1, bf4) -= 0.25 * D(bf2, bf3) *
+                                                         value_scal_by_deg;
+                                          g(bf2, bf3) -= 0.25 * D(bf1, bf4) *
+                                                         value_scal_by_deg;
+                                      }
+                                  }
+                              }
+                          }
+                      }
+                  }
+              }
+          }
+      } else {
+          // loop over permutationally-unique set of shells
+          for (auto s1 = 0l, s1234 = 0l; s1 != nshells; ++s1) {
+              if (s1 % nthreads != thread_id) continue;
+
+              auto bf1_first =
+                  shell2bf[s1];  // first basis function in this shell
+              auto n1 =
+                  obs[s1].size();  // number of basis functions in this shell
+
+              for (const auto& s2 : obs_shellpair_list[s1]) {
+                  auto bf2_first = shell2bf[s2];
+                  auto n2 = obs[s2].size();
+
+                  const auto Dnorm12 =
+                      do_schwartz_screen ? D_shblk_norm(s1, s2) : 0.;
+                  const auto Q12 = do_schwartz_screen ? Q(s1, s2) : 0.;
+
+                  for (auto s3 = 0; s3 <= s1; ++s3) {
+                      auto bf3_first = shell2bf[s3];
+                      auto n3 = obs[s3].size();
+
+                      const auto Dnorm123 = do_schwartz_screen
+                                                ? std::max(D_shblk_norm(s1, s3),
+                                                           D_shblk_norm(s2, s3))
+                                                : 0.;
+
+                      const auto s4_max = (s1 == s3) ? s2 : s3;
+                      for (const auto& s4 : obs_shellpair_list[s3]) {
+                          if (s4 > s4_max)
+                              break;  // for each s3, s4 are stored in
+                                      // monotonically increasing order
+
+                          const auto Dnorm1234 =
+                              do_schwartz_screen
+                                  ? std::max(D_shblk_norm(s1, s4),
+                                             std::max(D_shblk_norm(s2, s4),
+                                                      Dnorm123))
+                                  : 0.;
+
+                          if (do_schwartz_screen &&
+                              Dnorm1234 * Q12 * Schwartz(s3, s4) < precision)
+                              continue;
+
+                          auto bf4_first = shell2bf[s4];
+                          auto n4 = obs[s4].size();
+
+                          num_k_computed += n1 * n2 * n3 * n4;
+
+                          // compute the permutational degeneracy (i.e. # of
+                          // equivalents) of the given shell set
+                          auto s12_deg = (s1 == s2) ? 1.0 : 2.0;
+                          auto s34_deg = (s3 == s4) ? 1.0 : 2.0;
+                          auto s12_34_deg =
+                              (s1 == s3) ? (s2 == s4 ? 1.0 : 2.0) : 2.0;
+                          auto s1234_deg = s12_deg * s34_deg * s12_34_deg;
+
+#if defined(REPORT_INTEGRAL_TIMINGS)
+                          timer.start(0);
+#endif
+
+                          const auto* buf = engine.compute(obs[s1], obs[s2],
+                                                           obs[s3], obs[s4]);
+
+#if defined(REPORT_INTEGRAL_TIMINGS)
+                          timer.stop(0);
+#endif
+
+                          // 1) each shell set of integrals contributes up to 6
+                          // shell sets of the Fock matrix:
+                          //    F(a,b) += (ab|cd) * D(c,d)
+                          //    F(c,d) += (ab|cd) * D(a,b)
+                          //    F(b,d) -= 1/4 * (ab|cd) * D(a,c)
+                          //    F(b,c) -= 1/4 * (ab|cd) * D(a,d)
+                          //    F(a,c) -= 1/4 * (ab|cd) * D(b,d)
+                          //    F(a,d) -= 1/4 * (ab|cd) * D(b,c)
+                          // 2) each permutationally-unique integral (shell set)
+                          // must be scaled by its degeneracy,
+                          //    i.e. the number of the integrals/sets equivalent
+                          //    to it
+                          // 3) the end result must be symmetrized
+                          for (auto f1 = 0, f1234 = 0; f1 != n1; ++f1) {
+                              const auto bf1 = f1 + bf1_first;
+                              for (auto f2 = 0; f2 != n2; ++f2) {
+                                  const auto bf2 = f2 + bf2_first;
+                                  for (auto f3 = 0; f3 != n3; ++f3) {
+                                      const auto bf3 = f3 + bf3_first;
+                                      for (auto f4 = 0; f4 != n4;
+                                           ++f4, ++f1234) {
+                                          const auto bf4 = f4 + bf4_first;
+
+                                          const auto value = buf[f1234];
+
+                                          const auto value_scal_by_deg =
+                                              value * s1234_deg;
+
+                                          // g(bf1,bf2) += D(bf3,bf4) *
+                                          // value_scal_by_deg;
+                                          // g(bf3,bf4) += D(bf1,bf2) *
+                                          // value_scal_by_deg;
+                                          g(bf1, bf3) -= 0.25 * D(bf2, bf4) *
+                                                         value_scal_by_deg;
+                                          g(bf2, bf4) -= 0.25 * D(bf1, bf3) *
+                                                         value_scal_by_deg;
+                                          g(bf1, bf4) -= 0.25 * D(bf2, bf3) *
+                                                         value_scal_by_deg;
+                                          g(bf2, bf3) -= 0.25 * D(bf1, bf4) *
+                                                         value_scal_by_deg;
+                                      }
+                                  }
+                              }
+                          }
+                      }
+                  }
+              }
+          }
+      }
+
+  };  // end of lambda
+
+  namespace tim = std::chrono;
+  using dur = tim::duration<double>;
+
+  auto j0 = tim::high_resolution_clock::now();
+  libint2::parallel_do(lambdaJ);
+  auto j1 = tim::high_resolution_clock::now();
+  libint2::parallel_do(lambdaK);
+  auto k1 = tim::high_resolution_clock::now();
+
+  dur jtime = j1 - j0;
+  dur ktime = k1 - j1;
+
+  std::cout << "\tJ time = " << jtime.count() << std::endl;
+  std::cout << "\tPrescreen time = " << pstime.count() << std::endl;
+  std::cout << "\tK time = " << ktime.count() << std::endl;
+  k_times.push_back(ktime.count());
 
   // accumulate contributions from all threads
   for(size_t i=1; i!=nthreads; ++i) {
@@ -1234,7 +1780,11 @@ Matrix compute_2body_fock(const BasisSet& obs,
 
   Matrix GG = 0.5 * (G[0] + G[0].transpose());
 
-  std::cout << "# of integrals = " << num_ints_computed << std::endl;
+  std::cout << "\t# of coloumb integrals = " << num_j_computed << std::endl;
+  std::cout << "\t# of exchange integrals = " << num_k_computed << std::endl;
+
+  j_ints.push_back(num_j_computed);
+  k_ints.push_back(num_k_computed);
 
   // symmetrize the result and return
   return GG;
