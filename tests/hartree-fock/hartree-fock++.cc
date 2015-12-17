@@ -487,14 +487,14 @@ int main(int argc, char *argv[]) {
     std::cout << "Average K time = " << sum/k_times.size() << std::endl;
     sum = 0.;
     for(auto t : j_ints){
-        sum += t;
+        sum += double(t)/double(j_ints.size());
     }
-    std::cout << "Average J Integrals = " << sum/j_ints.size() << std::endl;
+    std::cout << "Average J Integrals = " << sum << std::endl;
     sum = 0.;
     for(auto t : k_ints){
-        sum += t;
+        sum += double(t)/double(k_ints.size());
     }
-    std::cout << "Average K Integrals = " << sum/k_ints.size() << std::endl;
+    std::cout << "Average K Integrals = " << sum << std::endl;
     libint2::cleanup(); // done with libint
 
   } // end of try block; if any exceptions occurred, report them and exit cleanly
@@ -1120,8 +1120,8 @@ Matrix compute_2body_fock(const BasisSet& obs,
   for(size_t i=1; i!=nthreads; ++i) {
     engines[i] = engines[0];
   }
-  std::atomic<size_t> num_j_computed{0};
-  std::atomic<size_t> num_k_computed{0};
+  std::atomic<std::size_t> num_j_computed{0};
+  std::atomic<std::size_t> num_k_computed{0};
 
 #if defined(REPORT_INTEGRAL_TIMINGS)
   std::vector<libint2::Timers<1>> timers(nthreads);
@@ -1144,7 +1144,7 @@ Matrix compute_2body_fock(const BasisSet& obs,
   std::vector<double> max_D(nshells);
   for(auto i = 0; i < Q.rows(); ++i){
       max_Q[i] = Q.row(i).lpNorm<Eigen::Infinity>();
-      max_D[i] = D.row(i).lpNorm<Eigen::Infinity>();
+      max_D[i] = Ds.row(i).lpNorm<Eigen::Infinity>();
   }
 
   auto prescreen0 = tim::high_resolution_clock::now();
@@ -1251,6 +1251,35 @@ Matrix compute_2body_fock(const BasisSet& obs,
       }
   }
 
+#endif
+
+#if 1 // Drew's significant s3 for S1 builder
+  // Vector to hold significant \nu for every \mu
+  std::vector<std::vector<int>> sig_nu_in_mus(nshells);
+  for (auto s1 = 0; s1 != nshells; ++s1) {
+      for (auto s2 : obs_shellpair_list[s1]) {
+          const auto Q12 = Q(s1, s2);
+
+          auto maxD = 0.0;
+          for (auto s3 = 0; s3 <= s1; ++s3) {
+              // Don't add s3 twice
+              auto iter = std::find(sig_nu_in_mus[s1].begin(),
+                      sig_nu_in_mus[s1].end(), s3);
+              if (iter == sig_nu_in_mus[s1].end()) {
+                  // maxD is actually the max possible val for Ds(s1,s3), Ds(s1,s4),
+                  // Ds(s2,s3), Ds(s2,s4)
+                  maxD = std::max({maxD, Ds(s1, s3), Ds(s2, s3)});
+                  const auto maxS3D = maxD * max_Q[s3];
+                  auto est = Q12 * maxS3D;
+
+                  if (est >= precision) {
+                      sig_nu_in_mus[s1].push_back(s3);
+                  }
+              }
+          }
+      }
+  }
+
   using sorted_shell_pair_list = 
       std::unordered_map<std::size_t, std::vector<std::pair<int, double>>>;
 
@@ -1267,28 +1296,6 @@ Matrix compute_2body_fock(const BasisSet& obs,
               return b.second < a.second;
           });
       nu_sig_sorted[i] = std::move(sign_sig);
-  }
-#endif
-
-#if 1 // Drew's significant s3 for S1 builder
-  // Vector to hold significant \nu for every \mu
-  std::vector<std::unordered_set<int>> sig_nu_in_mus(nshells);
-  for(auto s1 = 0; s1 != nshells; ++s1){
-      for(auto s2 : obs_shellpair_list[s1]){
-          const auto Q12 = Q(s1,s2);
-
-          auto maxD = 0.0;
-          for(auto s3 = 0; s3 <= s1; ++s3){
-              maxD = std::max({maxD, Ds(s1,s3), Ds(s2,s3)});
-              const auto est = Q12 * maxD * max_Q[s3];
-              if(est >= precision){
-                  auto iter = sig_nu_in_mus[s1].find(s3);
-                  if(iter == sig_nu_in_mus[s1].end()){
-                      sig_nu_in_mus[s1].insert(s3);
-                  }
-              }
-          }
-      }
   }
 #endif
 
@@ -1536,22 +1543,34 @@ Matrix compute_2body_fock(const BasisSet& obs,
                   auto bf2_first = shell2bf[s2];
                   auto n2 = obs[s2].size();
 
+                  const auto Q12 = Schwartz(s1,s2);
+                  const auto maxQ12D12 = Q12 * std::max(max_D[s1],max_D[s2]);
+
                   for (auto s3 : sig_nu_in_mus[s1]) {
                       auto bf3_first = shell2bf[s3];
                       auto n3 = obs[s3].size();
 
+                      const auto maxD123 = std::max(Ds(s1,s3),Ds(s2,s3));
+
                       const auto s4_max = (s1 == s3) ? s2 : s3;
-                      for (const auto& s4 : obs_shellpair_list[s3]) {
-                          if (s4 > s4_max) break;
+                      for (auto it = nu_sig_sorted[s3].begin(); it != nu_sig_sorted[s3].end(); ++it){
+                          const auto s4 = it->first;
+                          if (s4 > s4_max) continue;
+
+                          const auto Q34 = Schwartz(s3,s4);
+                       
+                          const auto break_val = maxQ12D12 * Q34;
+                          if(break_val < precision){
+                              break; // Sorted s4 
+                          }
 
                           const auto Dnorm1234 =
                               do_schwartz_screen
-                                  ? std::max({Ds(s1, s4), Ds(s1, s3),
-                                              Ds(s2, s3), Ds(s2, s4)})
+                                  ? std::max({maxD123, Ds(s1,s4), Ds(s2,s4)})
                                   : 0.;
 
                           if (do_schwartz_screen &&
-                              Dnorm1234 * Schwartz(s1,s2) * Schwartz(s3, s4) < precision)
+                              Dnorm1234 * Q12 * Q34 < precision)
                               continue;
 
                           auto bf4_first = shell2bf[s4];
