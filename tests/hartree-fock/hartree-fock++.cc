@@ -30,6 +30,7 @@
 #include <iterator>
 #include <unordered_map>
 #include <unordered_set>
+#include <boost/functional/hash.hpp>
 #include <mutex>
 
 // Eigen matrix algebra library
@@ -325,7 +326,7 @@ int main(int argc, char *argv[]) {
     /***          SCF loop           ***/
     /*** =========================== ***/
 
-    const auto maxiter = 40;
+    const auto maxiter = 20;
     const auto conv = 1e-12;
     auto iter = 0;
     auto rms_error = 1.0;
@@ -1143,18 +1144,19 @@ Matrix compute_2body_fock(const BasisSet& obs,
   std::vector<double> max_Q(nshells);
   std::vector<double> max_D(nshells);
   for(auto i = 0; i < Q.rows(); ++i){
-      max_Q[i] = Q.row(i).lpNorm<Eigen::Infinity>();
-      max_D[i] = Ds.row(i).lpNorm<Eigen::Infinity>();
+      max_Q[i] = Q.lpNorm<Eigen::Infinity>();
+      max_D[i] = Ds.lpNorm<Eigen::Infinity>();
   }
 
   auto prescreen0 = tim::high_resolution_clock::now();
 
-#if 0 // LinK style loops
+#if 1 // LinK style loops
+  std::vector<std::vector<std::pair<int,double>>> sig_nu_in_mus(nshells);
   // Loop over all significant \mu and all significant \nu 
   for(auto s1 = 0; s1 != nshells; ++s1){
-      for(auto s3=0; s3<=s1; ++s3) {
-          if(Ds(s1, s3) * max_Q[s1] * max_Q[s3] > precision){
-              auto d_nu_bound = Ds(s1,s3) * max_Q[s3];
+      for(auto s3=0; s3!=nshells; ++s3) {
+          if(max_Q[s1] * max_Q[s3] * Ds(s1,s3) > precision){
+              auto d_nu_bound = Ds(s1, s3) * max_Q[s3];
               sig_nu_in_mus[s1].push_back(std::make_pair(s3,d_nu_bound));
           }
       }
@@ -1169,91 +1171,27 @@ Matrix compute_2body_fock(const BasisSet& obs,
       });
   }
 
-  for(auto s1 = 0; s1 != nshells; ++s1){
-      for(auto s2 : obs_shellpair_list[s1]){
-          for(auto s3 = 0; s3 <= s1; ++s3){
-              bool already_have_s3 = false;
-              for(auto const &lpair : sig_nu_in_mus[s1]){
-                  if(s3 == lpair.first){
-                      already_have_s3 = true;
-                      break;
-                  }
-              }
+  using sorted_shell_pair_list = 
+      std::unordered_map<std::size_t, std::vector<std::pair<int, double>>>;
 
-              if (!already_have_s3) {
-                  for (auto const& lpair : sig_nu_in_mus[s2]) {
-                      if (s3 == lpair.first) {
-                          already_have_s3 = true;
-                          break;
-                      }
-                  }
-              }
-
-              if (!already_have_s3) {
-                  const auto s4_max = (s1 == s3) ? s2 : s3;
-                  for (auto s4 : obs_shellpair_list[s3]) {
-                      if (s4 > s4_max) continue;
-                      auto maxd = std::max(
-                          {Ds(s1, s3), Ds(s1, s4), Ds(s2, s3), Ds(s2, s4)});
-                      auto Q12 = Q(s1, s2);
-                      auto Q34 = Q(s3, s4);
-                      auto val = maxd * Q12 * Q34;
-                      if (val > precision) {
-                          std::cout << "For {s1,s2,s3,s4} = {"
-                                    << s1 << "," << s2 << "," << s3 << "," << s4
-                                    << "} with thresh = " << precision << std::endl;
-                          std::cout << "\ts3 in s1: ";
-                          for(auto &lpair : sig_nu_in_mus[s1]){
-                              std::cout << lpair.first << " ";
-                          }
-                          std::cout << std::endl;
-                          std::cout << "\ts3 in s2: ";
-                          for(auto &lpair : sig_nu_in_mus[s2]){
-                              std::cout << lpair.first << " ";
-                          }
-                          std::cout << std::endl;
-                          std::cout << "\tmaxQ(s1) = " << max_Q[s1]
-                                    << std::endl;
-                          std::cout << "\tmaxQ(s3) = " << max_Q[s3]
-                                    << std::endl;
-                          std::cout << "\tmaxD(s1) = " << max_D[s1]
-                                    << std::endl;
-                          std::cout << "\tmaxD(s3) = " << max_D[s3]
-                                    << std::endl;
-                          std::cout << "\tmaxD(s2) = " << max_D[s2]
-                                    << std::endl;
-                          std::cout << "\tmaxD(s4) = " << max_D[s4]
-                                    << std::endl;
-                          std::cout << "\tD(s1,s3) = " << Ds(s1, s3)
-                                    << std::endl;
-                          std::cout << "\tD(s1,s4) = " << Ds(s1, s4)
-                                    << std::endl;
-                          std::cout << "\tD(s2,s3) = " << Ds(s2, s3)
-                                    << std::endl;
-                          std::cout << "\tD(s2,s4) = " << Ds(s2, s4)
-                                    << std::endl;
-                          std::cout << "\tmaxQ(s1) * maxQ(s3) * D(s1,s3) = "
-                                    << max_Q[s1] * max_Q[s3] * Ds(s1, s3)
-                                    << std::endl;
-                          std::cout << "\tmaxQ(s1) * maxQ(s3) * D(s1,s4) = "
-                                    << max_Q[s1] * max_Q[s3] * Ds(s1, s4)
-                                    << std::endl;
-                          std::cout << "\tmaxQ(s1) * maxQ(s3) * D(s2,s3) = "
-                                    << max_Q[s1] * max_Q[s3] * Ds(s2, s3)
-                                    << std::endl;
-                          std::cout << "\tmaxQ(s1) * maxQ(s3) * D(s2,s4) = "
-                                    << max_Q[s1] * max_Q[s3] * Ds(s2, s4)
-                                    << std::endl;
-                      }
-                  }
-              }
-          }
+  sorted_shell_pair_list s4_sorted_for;
+  for (auto i = 0; i < nshells; ++i) {
+      std::vector<std::pair<int, double>> sign_sig;
+      for (auto j = 0; j < nshells; ++j) {
+          sign_sig.push_back(std::make_pair(j, Q(i, j)));
       }
+      std::sort(
+          sign_sig.begin(), sign_sig.end(),
+          [](std::pair<int, double> const& a, std::pair<int, double> const b) {
+              // Sort greatest to least
+              return b.second < a.second;
+          });
+      s4_sorted_for[i] = std::move(sign_sig);
   }
 
 #endif
 
-#if 1 // Drew's significant s3 for S1 builder
+#if 0 // Drew's significant s3 for S1 builder
   // Vector to hold significant \nu for every \mu
   std::vector<std::vector<int>> sig_nu_in_mus(nshells);
   for (auto s1 = 0; s1 != nshells; ++s1) {
@@ -1412,9 +1350,12 @@ Matrix compute_2body_fock(const BasisSet& obs,
       timer.set_now_overhead(25);
 #endif
       if (use_linK) {
-#if 0 // LinK style looping
+#if 1 // LinK style looping
           // significant \nu \sigma for \mu and \lambda
-          std::vector<std::pair<int, int>> sig_kets;
+          using pair_set = std::unordered_set<std::pair<int, int>,
+                                              boost::hash<std::pair<int, int>>>;
+
+          pair_set sig_kets;
           for (auto s1 = 0l, s1234 = 0l; s1 != nshells; ++s1) {
               if (s1 % nthreads != thread_id) continue;
               auto bf1_first = shell2bf[s1];
@@ -1425,37 +1366,65 @@ Matrix compute_2body_fock(const BasisSet& obs,
                   auto n2 = obs[s2].size();
 
                   const auto Q12 = Q(s1, s2);
-                  sig_kets.resize(0);
 
+                  sig_kets.clear();
                   for (auto const& nu : sig_nu_in_mus[s1]) {
                       const auto s3 = nu.first;
+                      if (s3 > s1) continue;
 
                       const auto D13 = Ds(s1, s3);
-                      const auto D23 = Ds(s2, s3);
 
-                      auto at_least_one_sig = false;
+                      const auto num_kets = sig_kets.size();
                       const auto s4_max = (s1 == s3) ? s2 : s3;
-
-                      for (const auto& idx_val : nu_sig_sorted[s3]) {
-                          const auto s4 = idx_val.first;
-                          if (s4 > s4_max) continue;
-
-                          auto dmax =
-                              std::max({D13, Ds(s1, s4), D23, Ds(s2, s4)});
-
-                          if (dmax * Q12 * Q(s3, s4) > precision) {
-                              sig_kets.push_back(std::make_pair(s3, s4));
-                              at_least_one_sig = true;
-                          } else {
-                              break;
+                      const auto b = s3;
+                      for (auto a = 0; a <= s1; ++a) {
+                          auto Qab = Q(b,a);
+                          if (Q12 * D13 * Qab > precision) {
+                              if(a <= s4_max){
+                                  sig_kets.insert(std::make_pair(b,a));
+                              }
+                              auto b_max = (s1 == a) ? s2 : a;
+                              if (a != s3 && b <= b_max) {  // b must be s3
+                                  sig_kets.insert(std::make_pair(a, b));
+                              }
                           }
                       }
-
-                      // Leave loop if we added 0 \sigmas
-                      if (!at_least_one_sig) {
-                          break;
+                      if(num_kets == sig_kets.size()){
+                          // break;
                       }
                   }
+
+                  for (auto const& nu : sig_nu_in_mus[s2]) {
+                      const auto s3 = nu.first;
+                      if (s3 > s1) continue;
+
+                      const auto D23 = Ds(s2, s3);
+
+                      const auto s4_max = (s1 == s3) ? s2 : s3;
+                      const auto b = s3;
+                      for (auto a = 0; a <= s1; ++a) {
+                          auto Qab = Q(b,a);
+                          if (Q12 * D23 * Qab > precision) {
+                              if(a <= s4_max){
+                                  sig_kets.insert(std::make_pair(b,a));
+                              }
+                              auto b_max = (s1 == a) ? s2 : a;
+                              if (a != s3 && b <= b_max) {  // b must be s3
+                                  sig_kets.insert(std::make_pair(a, b));
+                              }
+                          }
+                      }
+                  }
+
+                  // // Deal with S2 fully to limit source of error from s1
+                  // for(auto s3 = 0; s3 <= s1; ++s3){
+                  //     const auto s4_max = (s1 == s3) ? s2 : s3;
+                  //     for(auto s4 = 0; s4 <= s4_max; ++s4){
+                  //         if(Q12 * std::max(Ds(s2,s3), Ds(s2,s4)) * Q(s3,s4) >= precision){
+                  //             sig_kets.insert(std::make_pair(s3,s4));
+                  //         }
+                  //     }
+                  // }
 
                   for (auto const &sig_ket : sig_kets) {
                       const auto s3 = sig_ket.first;
@@ -1533,6 +1502,7 @@ Matrix compute_2body_fock(const BasisSet& obs,
               }
           }
 #endif // LinK style looping
+#if 0
           for (auto s1 = 0l, s1234 = 0l; s1 != nshells; ++s1) {
               if (s1 % nthreads != thread_id) continue;
 
@@ -1546,7 +1516,8 @@ Matrix compute_2body_fock(const BasisSet& obs,
                   const auto Q12 = Schwartz(s1,s2);
                   const auto maxQ12D12 = Q12 * std::max(max_D[s1],max_D[s2]);
 
-                  for (auto s3 : sig_nu_in_mus[s1]) {
+                  for (auto s3_pair : sig_nu_in_mus[s1]) {
+                      const auto s3 = s3_pair.first;
                       auto bf3_first = shell2bf[s3];
                       auto n3 = obs[s3].size();
 
@@ -1645,6 +1616,7 @@ Matrix compute_2body_fock(const BasisSet& obs,
                   }
               }
           }
+#endif
       } else {
           // loop over permutationally-unique set of shells
           for (auto s1 = 0l, s1234 = 0l; s1 != nshells; ++s1) {
