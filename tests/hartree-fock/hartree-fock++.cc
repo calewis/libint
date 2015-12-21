@@ -1154,11 +1154,9 @@ Matrix compute_2body_fock(const BasisSet& obs,
   std::vector<std::vector<std::pair<int,double>>> sig_nu_in_mus(nshells);
   // Loop over all significant \mu and all significant \nu 
   for(auto s1 = 0; s1 != nshells; ++s1){
-      for(auto s3=0; s3!=nshells; ++s3) {
-          if(max_Q[s1] * max_Q[s3] * Ds(s1,s3) > precision){
-              auto d_nu_bound = Ds(s1, s3) * max_Q[s3];
-              sig_nu_in_mus[s1].push_back(std::make_pair(s3,d_nu_bound));
-          }
+      for(auto s3=0; s3 != nshells; ++s3) {
+          auto d_nu_bound = Ds(s1, s3) * max_Q[s3];
+          sig_nu_in_mus[s1].push_back(std::make_pair(s3,d_nu_bound));
       }
 
       // Sort \nu by size of D(\mu,\nu) * max_Q[\nu]
@@ -1174,7 +1172,7 @@ Matrix compute_2body_fock(const BasisSet& obs,
   using sorted_shell_pair_list = 
       std::unordered_map<std::size_t, std::vector<std::pair<int, double>>>;
 
-  sorted_shell_pair_list s4_sorted_for;
+  sorted_shell_pair_list a_sorted_for;
   for (auto i = 0; i < nshells; ++i) {
       std::vector<std::pair<int, double>> sign_sig;
       for (auto j = 0; j < nshells; ++j) {
@@ -1186,7 +1184,7 @@ Matrix compute_2body_fock(const BasisSet& obs,
               // Sort greatest to least
               return b.second < a.second;
           });
-      s4_sorted_for[i] = std::move(sign_sig);
+      a_sorted_for[i] = std::move(sign_sig);
   }
 
 #endif
@@ -1337,8 +1335,6 @@ Matrix compute_2body_fock(const BasisSet& obs,
 
   }; // end of lambda
 
-    
-
   auto lambdaK = [&](int thread_id) {
 
       auto& engine = engines[thread_id];
@@ -1370,48 +1366,57 @@ Matrix compute_2body_fock(const BasisSet& obs,
                   sig_kets.clear();
                   for (auto const& nu : sig_nu_in_mus[s1]) {
                       const auto s3 = nu.first;
-                      if (s3 > s1) continue;
+                      if(s3 > s1) continue;
+                      if(Q12 * nu.second < precision){
+                          break; 
+                      }
 
                       const auto D13 = Ds(s1, s3);
 
-                      const auto num_kets = sig_kets.size();
                       const auto s4_max = (s1 == s3) ? s2 : s3;
-                      const auto b = s3;
-                      for (auto a = 0; a <= s1; ++a) {
-                          auto Qab = Q(b,a);
-                          if (Q12 * D13 * Qab > precision) {
-                              if(a <= s4_max){
-                                  sig_kets.insert(std::make_pair(b,a));
+                      for (auto const& a_pair : a_sorted_for[s3]) {
+                          auto s4 = a_pair.first;
+                          if(s4 > s1) continue;
+                          const auto Q34 = Q(s3,s4);
+                          if(Q12 * D13 * Q34 >= precision){
+                              if(s4 <= s4_max){
+                                  sig_kets.insert(std::make_pair(s3,s4));
                               }
-                              auto b_max = (s1 == a) ? s2 : a;
-                              if (a != s3 && b <= b_max) {  // b must be s3
-                                  sig_kets.insert(std::make_pair(a, b));
+                              const auto flip_max = (s1 == s4) ? s2 : s4;
+                              if(s3 <= flip_max){
+                                  sig_kets.insert(std::make_pair(s4,s3));
                               }
+                          } else {
+                              break;
                           }
-                      }
-                      if(num_kets == sig_kets.size()){
-                          // break;
                       }
                   }
 
                   for (auto const& nu : sig_nu_in_mus[s2]) {
                       const auto s3 = nu.first;
-                      if (s3 > s1) continue;
+                      if(s3 > s1) continue;
+                      if(Q12 * nu.second < precision){
+                          break; 
+                      }
 
                       const auto D23 = Ds(s2, s3);
 
                       const auto s4_max = (s1 == s3) ? s2 : s3;
-                      const auto b = s3;
-                      for (auto a = 0; a <= s1; ++a) {
-                          auto Qab = Q(b,a);
-                          if (Q12 * D23 * Qab > precision) {
-                              if(a <= s4_max){
-                                  sig_kets.insert(std::make_pair(b,a));
+                      for (auto const& a_pair : a_sorted_for[s3]) {
+                          auto s4 = a_pair.first;
+                          if(s4 > s1) continue;
+
+                          const auto Q34 = Q(s3,s4);
+                          if(Q12 * D23 * Q34 >= precision){
+                              if(s4 <= s4_max){
+                                  sig_kets.insert(std::make_pair(s3,s4));
                               }
-                              auto b_max = (s1 == a) ? s2 : a;
-                              if (a != s3 && b <= b_max) {  // b must be s3
-                                  sig_kets.insert(std::make_pair(a, b));
+                              const auto flip_max = (s1 == s4) ? s2 : s4;
+                              if(s3 <= flip_max){
+                                  sig_kets.insert(std::make_pair(s4,s3));
                               }
+                          } else {
+                              break;
                           }
                       }
                   }
@@ -1420,13 +1425,14 @@ Matrix compute_2body_fock(const BasisSet& obs,
                   // for(auto s3 = 0; s3 <= s1; ++s3){
                   //     const auto s4_max = (s1 == s3) ? s2 : s3;
                   //     for(auto s4 = 0; s4 <= s4_max; ++s4){
-                  //         if(Q12 * std::max(Ds(s2,s3), Ds(s2,s4)) * Q(s3,s4) >= precision){
+                  //         if(Q12 * std::max(Ds(s2,s3), Ds(s2,s4)) * Q(s3,s4)
+                  //         >= precision){
                   //             sig_kets.insert(std::make_pair(s3,s4));
                   //         }
                   //     }
                   // }
 
-                  for (auto const &sig_ket : sig_kets) {
+                  for (auto const& sig_ket : sig_kets) {
                       const auto s3 = sig_ket.first;
                       const auto s4 = sig_ket.second;
 
@@ -1494,121 +1500,6 @@ Matrix compute_2body_fock(const BasisSet& obs,
                                                      value_scal_by_deg;
                                       g(bf2, bf3) -= 0.25 * D(bf1, bf4) *
                                                      value_scal_by_deg;
-                                  }
-                              }
-                          }
-                      }
-                  }
-              }
-          }
-#endif // LinK style looping
-#if 0
-          for (auto s1 = 0l, s1234 = 0l; s1 != nshells; ++s1) {
-              if (s1 % nthreads != thread_id) continue;
-
-              auto bf1_first = shell2bf[s1];
-              auto n1 = obs[s1].size();  
-
-              for (const auto& s2 : obs_shellpair_list[s1]) {
-                  auto bf2_first = shell2bf[s2];
-                  auto n2 = obs[s2].size();
-
-                  const auto Q12 = Schwartz(s1,s2);
-                  const auto maxQ12D12 = Q12 * std::max(max_D[s1],max_D[s2]);
-
-                  for (auto s3_pair : sig_nu_in_mus[s1]) {
-                      const auto s3 = s3_pair.first;
-                      auto bf3_first = shell2bf[s3];
-                      auto n3 = obs[s3].size();
-
-                      const auto maxD123 = std::max(Ds(s1,s3),Ds(s2,s3));
-
-                      const auto s4_max = (s1 == s3) ? s2 : s3;
-                      for (auto it = nu_sig_sorted[s3].begin(); it != nu_sig_sorted[s3].end(); ++it){
-                          const auto s4 = it->first;
-                          if (s4 > s4_max) continue;
-
-                          const auto Q34 = Schwartz(s3,s4);
-                       
-                          const auto break_val = maxQ12D12 * Q34;
-                          if(break_val < precision){
-                              break; // Sorted s4 
-                          }
-
-                          const auto Dnorm1234 =
-                              do_schwartz_screen
-                                  ? std::max({maxD123, Ds(s1,s4), Ds(s2,s4)})
-                                  : 0.;
-
-                          if (do_schwartz_screen &&
-                              Dnorm1234 * Q12 * Q34 < precision)
-                              continue;
-
-                          auto bf4_first = shell2bf[s4];
-                          auto n4 = obs[s4].size();
-
-                          num_k_computed += n1 * n2 * n3 * n4;
-
-                          // compute the permutational degeneracy (i.e. # of
-                          // equivalents) of the given shell set
-                          auto s12_deg = (s1 == s2) ? 1.0 : 2.0;
-                          auto s34_deg = (s3 == s4) ? 1.0 : 2.0;
-                          auto s12_34_deg =
-                              (s1 == s3) ? (s2 == s4 ? 1.0 : 2.0) : 2.0;
-                          auto s1234_deg = s12_deg * s34_deg * s12_34_deg;
-
-#if defined(REPORT_INTEGRAL_TIMINGS)
-                          timer.start(0);
-#endif
-
-                          const auto* buf = engine.compute(obs[s1], obs[s2],
-                                                           obs[s3], obs[s4]);
-
-#if defined(REPORT_INTEGRAL_TIMINGS)
-                          timer.stop(0);
-#endif
-
-                          // 1) each shell set of integrals contributes up to 6
-                          // shell sets of the Fock matrix:
-                          //    F(a,b) += (ab|cd) * D(c,d)
-                          //    F(c,d) += (ab|cd) * D(a,b)
-                          //    F(b,d) -= 1/4 * (ab|cd) * D(a,c)
-                          //    F(b,c) -= 1/4 * (ab|cd) * D(a,d)
-                          //    F(a,c) -= 1/4 * (ab|cd) * D(b,d)
-                          //    F(a,d) -= 1/4 * (ab|cd) * D(b,c)
-                          // 2) each permutationally-unique integral (shell set)
-                          // must be scaled by its degeneracy,
-                          //    i.e. the number of the integrals/sets equivalent
-                          //    to it
-                          // 3) the end result must be symmetrized
-                          for (auto f1 = 0, f1234 = 0; f1 != n1; ++f1) {
-                              const auto bf1 = f1 + bf1_first;
-                              for (auto f2 = 0; f2 != n2; ++f2) {
-                                  const auto bf2 = f2 + bf2_first;
-                                  for (auto f3 = 0; f3 != n3; ++f3) {
-                                      const auto bf3 = f3 + bf3_first;
-                                      for (auto f4 = 0; f4 != n4;
-                                           ++f4, ++f1234) {
-                                          const auto bf4 = f4 + bf4_first;
-
-                                          const auto value = buf[f1234];
-
-                                          const auto value_scal_by_deg =
-                                              value * s1234_deg;
-
-                                          // g(bf1,bf2) += D(bf3,bf4) *
-                                          // value_scal_by_deg;
-                                          // g(bf3,bf4) += D(bf1,bf2) *
-                                          // value_scal_by_deg;
-                                          g(bf1, bf3) -= 0.25 * D(bf2, bf4) *
-                                                         value_scal_by_deg;
-                                          g(bf2, bf4) -= 0.25 * D(bf1, bf3) *
-                                                         value_scal_by_deg;
-                                          g(bf1, bf4) -= 0.25 * D(bf2, bf3) *
-                                                         value_scal_by_deg;
-                                          g(bf2, bf3) -= 0.25 * D(bf1, bf4) *
-                                                         value_scal_by_deg;
-                                      }
                                   }
                               }
                           }
