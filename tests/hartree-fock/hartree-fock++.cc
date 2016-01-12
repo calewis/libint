@@ -1136,6 +1136,9 @@ Matrix compute_2body_fock_fake(const BasisSet& obs,
   }
   std::atomic<std::size_t> num_j_computed{0};
   std::atomic<std::size_t> num_k_computed{0};
+  std::atomic<std::size_t> num_k_loop_checked{0};
+  std::atomic<std::size_t> num_k_loop_computed{0};
+  std::atomic<std::size_t> num_k_loop_inserted{0};
 
 #if defined(REPORT_INTEGRAL_TIMINGS)
   std::vector<libint2::Timers<1>> timers(nthreads);
@@ -1415,13 +1418,16 @@ Matrix compute_2body_fock_fake(const BasisSet& obs,
                           if(s4 > s1) continue;
 
                           const auto Q34 = Q(s3,s4);
+                          ++num_k_loop_checked;
                           if(Q12 * D13 * Q34 >= precision){
                               if(s4 <= s4_max){
+                                  ++num_k_loop_inserted;
                                   insert(kets, sig_s3s, comp, computed_s3s, s3, s4);
                               }
 
                               const auto flip_max = (s1 == s4) ? s2 : s4;
                               if(s3 <= flip_max){
+                                  ++num_k_loop_inserted;
                                   insert(kets, sig_s3s, comp, computed_s3s, s4, s3);
                               }
                           } else {
@@ -1447,13 +1453,16 @@ Matrix compute_2body_fock_fake(const BasisSet& obs,
                               if (s4 > s1) continue;
 
                               const auto Q34 = Q(s3, s4);
+                              ++num_k_loop_checked;
                               if (Q12 * D23 * Q34 >= precision) {
                                   if (s4 <= s4_max) {
+                                      ++num_k_loop_inserted;
                                       insert(kets, sig_s3s, comp, computed_s3s,
                                              s3, s4);
                                   }
                                   const auto flip_max = (s1 == s4) ? s2 : s4;
                                   if (s3 <= flip_max) {
+                                      ++num_k_loop_inserted;
                                       insert(kets, sig_s3s, comp, computed_s3s,
                                              s4, s3);
                                   }
@@ -1472,6 +1481,7 @@ Matrix compute_2body_fock_fake(const BasisSet& obs,
                       auto n3 = obs[s3].size();
 
                       for(auto s4 : kets[s3]){
+                          ++num_k_loop_computed;
                           comp(s3,s4) = 0;
 
                       auto bf4_first = shell2bf[s4];
@@ -1531,9 +1541,13 @@ Matrix compute_2body_fock_fake(const BasisSet& obs,
                                                       Dnorm123))
                                   : 0.;
 
+
+                          ++num_k_loop_checked;
                           if (do_schwartz_screen &&
                               Dnorm1234 * Q12 * Schwartz(s3, s4) < precision)
                               continue;
+
+                          ++num_k_loop_computed;
 
                           auto bf4_first = shell2bf[s4];
                           auto n4 = obs[s4].size();
@@ -1591,6 +1605,9 @@ Matrix compute_2body_fock_fake(const BasisSet& obs,
 
   std::cout << "\t# of coloumb integrals = " << num_j_computed << std::endl;
   std::cout << "\t# of exchange integrals = " << num_k_computed << std::endl;
+  std::cout << "\t# of exchange checked = " << num_k_loop_checked << std::endl;
+  std::cout << "\t# of exchange inserted = " << num_k_loop_inserted << std::endl;
+  std::cout << "\t# of exchange computed = " << num_k_loop_computed << std::endl;
 
   j_ints.push_back(num_j_computed);
   k_ints.push_back(num_k_computed);
