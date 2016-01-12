@@ -112,6 +112,12 @@ compute_shellpair_list(const BasisSet& bs1,
                        double threshold = 1e-12
                       );
 
+Matrix compute_2body_fock_fake(const BasisSet& obs,
+                          const Matrix& D,
+                          double precision,
+                          const Matrix& Schwartz,
+                          bool use_linK = false);
+
 Matrix compute_2body_fock(const BasisSet& obs,
                           const Matrix& D,
                           double precision = std::numeric_limits<double>::epsilon(), // discard contributions smaller than this
@@ -329,7 +335,7 @@ int main(int argc, char *argv[]) {
     /***          SCF loop           ***/
     /*** =========================== ***/
 
-    const auto maxiter = 20;
+    const auto maxiter = 2;
     const auto conv = 1e-12;
     auto iter = 0;
     auto rms_error = 1.0;
@@ -378,7 +384,11 @@ int main(int argc, char *argv[]) {
       // build a new Fock matrix
       if (not do_density_fitting) {
         const auto precision_F = fock_precision;
-        F += compute_2body_fock(obs, D_diff, precision_F, K, use_linK);
+        if(iter != 2){
+            F += compute_2body_fock(obs, D_diff, precision_F, K, use_linK);
+        } else {
+            F += compute_2body_fock_fake(obs, D_diff, precision_F, K, use_linK);
+        }
       }
 #if HAVE_DENSITY_FITTING
       else { // do DF
@@ -1096,6 +1106,499 @@ Matrix compute_2body_2index_ints(const BasisSet& bs)
   return result;
 }
 
+Matrix compute_2body_fock_fake(const BasisSet& obs,
+                          const Matrix& D,
+                          double precision,
+                          const Matrix& Schwartz,
+                          bool use_linK) {
+
+  const auto n = obs.nbf();
+  const auto nshells = obs.size();
+  using libint2::nthreads;
+  std::vector<Matrix> G(nthreads, Matrix::Zero(n,n));
+
+  const auto do_schwartz_screen = Schwartz.cols() != 0 && Schwartz.rows() != 0;
+  Matrix D_shblk_norm; // matrix of norms of shell blocks
+  if (do_schwartz_screen) {
+    D_shblk_norm = compute_shellblock_norm(obs, D);
+  }
+
+  // construct the 2-electron repulsion integrals engine
+  typedef libint2::TwoBodyEngine<libint2::Coulomb> coulomb_engine_type;
+  std::vector<coulomb_engine_type> engines(nthreads);
+  engines[0] = coulomb_engine_type(obs.max_nprim(), obs.max_l(), 0);
+  engines[0].set_precision(std::min(precision,std::numeric_limits<double>::epsilon())); // shellset-dependent precision control will likely break positive definiteness
+                                       // stick with this simple recipe
+  std::cout << "compute_2body_fock:precision = " << precision << std::endl;
+  std::cout << "TwoBodyEngine::precision = " << engines[0].precision() << std::endl;
+  for(size_t i=1; i!=nthreads; ++i) {
+    engines[i] = engines[0];
+  }
+  std::atomic<std::size_t> num_j_computed{0};
+  std::atomic<std::size_t> num_k_computed{0};
+
+#if defined(REPORT_INTEGRAL_TIMINGS)
+  std::vector<libint2::Timers<1>> timers(nthreads);
+#endif
+
+  auto shell2bf = obs.shell2bf();
+
+  namespace tim = std::chrono;
+  using dur = tim::duration<double>;
+
+  // From 1998 LinK paper Ochsenfeld, White and Head-Gordon
+  // 4 center int is (\mu \lambda | \nu \sigma) 
+  
+
+  Matrix const &Q = Schwartz;
+  Matrix const &Ds = D_shblk_norm;
+
+  // Compute max vals in rows of Q but don't time for now
+  std::vector<double> max_Q(nshells);
+  std::vector<double> max_D(nshells);
+  for(auto i = 0; i < Q.rows(); ++i){
+      max_Q[i] = Q.lpNorm<Eigen::Infinity>();
+      max_D[i] = Ds.lpNorm<Eigen::Infinity>();
+  }
+
+  auto prescreen0 = tim::high_resolution_clock::now();
+
+#if 1 // LinK style loops
+  std::vector<std::vector<std::pair<int,double>>> sig_nu_in_mus(nshells);
+  // Loop over all significant \mu and all significant \nu 
+  for(auto s1 = 0; s1 != nshells; ++s1){
+      for(auto s3=0; s3 != nshells; ++s3) {
+          auto d_nu_bound = Ds(s1, s3) * max_Q[s3];
+          if(max_Q[s1] * d_nu_bound >= precision){
+              sig_nu_in_mus[s1].push_back(std::make_pair(s3,d_nu_bound));
+          }
+      }
+
+      // Sort \nu by size of D(\mu,\nu) * max_Q[\nu]
+      auto start = sig_nu_in_mus[s1].begin();
+      auto end = sig_nu_in_mus[s1].end();
+      std::sort(start, end, [](std::pair<int, double> const& a,
+                               std::pair<int, double> const b) {
+          // Sort greatest to least
+          return b.second < a.second;
+      });
+  }
+
+  using sorted_shell_pair_list = 
+      std::unordered_map<std::size_t, std::vector<std::pair<int, double>>>;
+
+  sorted_shell_pair_list a_sorted_for;
+  for (auto i = 0; i < nshells; ++i) {
+      std::vector<std::pair<int, double>> sign_sig;
+      for (auto j = 0; j < nshells; ++j) {
+          sign_sig.push_back(std::make_pair(j, Q(i, j)));
+      }
+      std::sort(
+          sign_sig.begin(), sign_sig.end(),
+          [](std::pair<int, double> const& a, std::pair<int, double> const b) {
+              // Sort greatest to least
+              return b.second < a.second;
+          });
+      a_sorted_for[i] = std::move(sign_sig);
+  }
+
+#endif
+
+#if 0 // Drew's significant s3 for S1 builder
+  // Vector to hold significant \nu for every \mu
+  std::vector<std::vector<int>> sig_nu_in_mus(nshells);
+  for (auto s1 = 0; s1 != nshells; ++s1) {
+      for (auto s2 : obs_shellpair_list[s1]) {
+          const auto Q12 = Q(s1, s2);
+
+          auto maxD = 0.0;
+          for (auto s3 = 0; s3 <= s1; ++s3) {
+              // Don't add s3 twice
+              auto iter = std::find(sig_nu_in_mus[s1].begin(),
+                      sig_nu_in_mus[s1].end(), s3);
+              if (iter == sig_nu_in_mus[s1].end()) {
+                  // maxD is actually the max possible val for Ds(s1,s3), Ds(s1,s4),
+                  // Ds(s2,s3), Ds(s2,s4)
+                  maxD = std::max({maxD, Ds(s1, s3), Ds(s2, s3)});
+                  const auto maxS3D = maxD * max_Q[s3];
+                  auto est = Q12 * maxS3D;
+
+                  if (est >= precision) {
+                      sig_nu_in_mus[s1].push_back(s3);
+                  }
+              }
+          }
+      }
+  }
+
+  using sorted_shell_pair_list = 
+      std::unordered_map<std::size_t, std::vector<std::pair<int, double>>>;
+
+  sorted_shell_pair_list nu_sig_sorted;
+  for (auto i = 0; i < nshells; ++i) {
+      std::vector<std::pair<int, double>> sign_sig;
+      for (auto const& j : obs_shellpair_list[i]) {
+          sign_sig.push_back(std::make_pair(j, Q(i, j)));
+      }
+      std::sort(
+          sign_sig.begin(), sign_sig.end(),
+          [](std::pair<int, double> const& a, std::pair<int, double> const b) {
+              // Sort greatest to least
+              return b.second < a.second;
+          });
+      nu_sig_sorted[i] = std::move(sign_sig);
+  }
+#endif
+
+  auto prescreen1 = tim::high_resolution_clock::now();
+  dur pstime = prescreen1 - prescreen0;
+
+  auto lambdaJ = [&] (int thread_id) {
+
+    auto& engine = engines[thread_id];
+    auto& g = G[thread_id];
+
+#if defined(REPORT_INTEGRAL_TIMINGS)
+    auto& timer = timers[thread_id];
+    timer.clear();
+    timer.set_now_overhead(25);
+#endif
+
+    // loop over permutationally-unique set of shells
+    for(auto s1=0l, s12 = 0l; s1!=nshells; ++s1) {
+      auto bf1_first = shell2bf[s1]; // first basis function in this shell
+      auto n1 = obs[s1].size();// number of basis functions in this shell
+
+      for(const auto& s2: obs_shellpair_list[s1]) {
+        if(s12++ % nthreads != thread_id)
+            continue;
+
+        auto bf2_first = shell2bf[s2];
+        auto n2 = obs[s2].size();
+
+        const auto Dnorm12 = do_schwartz_screen ? D_shblk_norm(s1,s2) : 0.;
+        const auto Q12 = do_schwartz_screen ? Q(s1,s2) : 0.;
+
+        for(auto s3=0; s3<=s1; ++s3) {
+          auto bf3_first = shell2bf[s3];
+          auto n3 = obs[s3].size();
+          
+          const auto s4_max = (s1 == s3) ? s2 : s3;
+          for(const auto& s4: obs_shellpair_list[s3]) {
+            if (s4 > s4_max) break; // for each s3, s4 are stored in monotonically increasing order
+
+            const auto Qest = Q12 * Q(s3,s4);
+            const auto est12 = Dnorm12 * Qest;
+            const auto est34 = Ds(s3,s4) * Qest;
+
+            if (do_schwartz_screen && std::max(est12, est34) < precision)
+              continue;
+
+            auto bf4_first = shell2bf[s4];
+            auto n4 = obs[s4].size();
+
+            num_j_computed += n1*n2*n3*n4;
+          }
+        }
+      }
+    }
+
+  }; // end of lambda
+
+  // Basically a hash table where each bin is an s3 and the inner vectors are s4s
+  using pair_set = std::vector<std::vector<int>>;
+  
+  // Vector to hold sig kets for each thread
+  std::vector<pair_set> sig_kets_vec(nthreads);
+  for(auto i = 0; i < nthreads; ++i){
+      sig_kets_vec[i] = pair_set(nshells);
+  }
+
+  // Reserve the maximum amount of space that each s3 could need interms of s4s
+  for(auto s1 = 0; s1 < nshells; ++s1){
+      auto size = 0;
+      for(auto s2 : obs_shellpair_list[s1]){
+         ++size;
+      }
+
+      for(auto i = 0; i < nthreads; ++i){
+         sig_kets_vec[i][s1].reserve(size);
+      }
+  }
+
+  // Vectors that tell us if there is a significant ket for s3
+  std::vector<std::vector<int>> computed_s3s_vec(nthreads);
+  for(auto i = 0; i < nthreads; ++i){
+      computed_s3s_vec[i] = std::vector<int>(nshells, 0);
+  }
+
+  // Vector that actually holds the index of the significant s3s
+  std::vector<std::vector<int>> sig_s3s_vec(nthreads);
+  for(auto i = 0; i < nthreads; ++i){
+      sig_s3s_vec[i].reserve(nshells);
+  }
+
+  // Matrices that hold the indices of significant s3 s4 pairs
+  std::vector<MatrixI> comp_vec(nthreads);
+  for(auto &comp : comp_vec){
+      comp = MatrixI::Zero(nshells, nshells);
+  }
+
+  auto insert = [](std::vector<std::vector<int>>& v, std::vector<int>& sig_v,
+                   MatrixI &comp,  std::vector<int> &computed_s3s, int s3, int s4) {
+      auto& s3_ket = v[s3];
+      if (!comp(s3, s4)) {
+          s3_ket.push_back(s4);
+          comp(s3, s4) = 1;
+      }
+      if (!computed_s3s[s3]) {
+          sig_v.push_back(s3);
+          computed_s3s[s3] = 1;
+      }
+  };
+
+  auto clear = [](std::vector<std::vector<int>> &v, std::vector<int> &sig_v){
+      for(auto i : sig_v){
+        v[i].clear();
+      }
+      sig_v.clear();
+  };
+
+  auto lambdaK = [&](int thread_id) {
+
+      auto& engine = engines[thread_id];
+      auto& g = G[thread_id];
+      auto& kets = sig_kets_vec[thread_id];
+      auto& comp = comp_vec[thread_id];
+      auto& computed_s3s = computed_s3s_vec[thread_id];
+      auto& sig_s3s = sig_s3s_vec[thread_id];
+
+#if defined(REPORT_INTEGRAL_TIMINGS)
+      auto& timer = timers[thread_id];
+      timer.clear();
+      timer.set_now_overhead(25);
+#endif
+      if (use_linK) {
+#if 1 // LinK style looping
+          // significant \nu \sigma for \mu and \lambda
+
+          for (auto s1 = 0l, s12 = 0l; s1 != nshells; ++s1) {
+                // if(s1 % nthreads != thread_id) continue;
+              auto bf1_first = shell2bf[s1];
+              auto n1 = obs[s1].size();
+
+              for (const auto& s2 : obs_shellpair_list[s1]) {
+                if(s12++ % nthreads != thread_id)
+                    continue;
+
+                  auto bf2_first = shell2bf[s2];
+                  auto n2 = obs[s2].size();
+
+                  const auto Q12 = Q(s1, s2);
+
+                  clear(kets, sig_s3s);
+
+                  for (auto const& nu : sig_nu_in_mus[s1]) {
+                      const auto s3 = nu.first;
+
+                      if(s3 > s1) continue;
+                      if(Q12 * nu.second < precision){
+                          break; 
+                      }
+
+                      const auto D13 = Ds(s1, s3);
+
+                      const auto s4_max = (s1 == s3) ? s2 : s3;
+                      for (auto const& a_pair : a_sorted_for[s3]) {
+                          auto s4 = a_pair.first;
+
+                          if(s4 > s1) continue;
+
+                          const auto Q34 = Q(s3,s4);
+                          if(Q12 * D13 * Q34 >= precision){
+                              if(s4 <= s4_max){
+                                  insert(kets, sig_s3s, comp, computed_s3s, s3, s4);
+                              }
+
+                              const auto flip_max = (s1 == s4) ? s2 : s4;
+                              if(s3 <= flip_max){
+                                  insert(kets, sig_s3s, comp, computed_s3s, s4, s3);
+                              }
+                          } else {
+                              break;
+                          }
+                      }
+                  }
+
+                  if (s2 != s1) {
+                      for (auto const& nu : sig_nu_in_mus[s2]) {
+                          const auto s3 = nu.first;
+                          if (s3 > s1) continue;
+                          if (Q12 * nu.second < precision) {
+                              break;
+                          }
+
+                          const auto D23 = Ds(s2, s3);
+
+                          const auto s4_max = (s1 == s3) ? s2 : s3;
+                          for (auto const& a_pair : a_sorted_for[s3]) {
+                              auto s4 = a_pair.first;
+
+                              if (s4 > s1) continue;
+
+                              const auto Q34 = Q(s3, s4);
+                              if (Q12 * D23 * Q34 >= precision) {
+                                  if (s4 <= s4_max) {
+                                      insert(kets, sig_s3s, comp, computed_s3s,
+                                             s3, s4);
+                                  }
+                                  const auto flip_max = (s1 == s4) ? s2 : s4;
+                                  if (s3 <= flip_max) {
+                                      insert(kets, sig_s3s, comp, computed_s3s,
+                                             s4, s3);
+                                  }
+                              } else {
+                                  break;
+                              }
+                          }
+                      }
+                  }
+
+                  auto s12_deg = (s1 == s2) ? 1.0 : 2.0;
+
+                  for(auto s3 : sig_s3s) {
+                      computed_s3s[s3] = 0;
+                      auto bf3_first = shell2bf[s3];
+                      auto n3 = obs[s3].size();
+
+                      for(auto s4 : kets[s3]){
+                          comp(s3,s4) = 0;
+
+                      auto bf4_first = shell2bf[s4];
+                      auto n4 = obs[s4].size();
+
+                      num_k_computed += n1 * n2 * n3 * n4;
+
+                      // compute the permutational degeneracy (i.e. # of
+                      // equivalents)
+                      // of the given shell set
+                      auto s34_deg = (s3 == s4) ? 1.0 : 2.0;
+                      auto s12_34_deg =
+                          (s1 == s3) ? (s2 == s4 ? 1.0 : 2.0) : 2.0;
+                      auto s1234_deg = s12_deg * s34_deg * s12_34_deg;
+
+                  }
+                  }
+              }
+          }
+#endif
+      } else {
+          // loop over permutationally-unique set of shells
+          for (auto s1 = 0l, s12 = 0l; s1 != nshells; ++s1) {
+               //  if(s1 % nthreads != thread_id) continue;
+
+              auto bf1_first = shell2bf[s1];  // first basis function in this shell
+              auto n1 = obs[s1].size();  // number of basis functions in this shell
+
+              for (const auto& s2 : obs_shellpair_list[s1]) {
+                if(s12++ % nthreads != thread_id)
+                    continue;
+                  auto bf2_first = shell2bf[s2];
+                  auto n2 = obs[s2].size();
+
+                  const auto Dnorm12 = do_schwartz_screen ? D_shblk_norm(s1, s2) : 0.;
+                  const auto Q12 = do_schwartz_screen ? Q(s1, s2) : 0.;
+
+                  for (auto s3 = 0; s3 <= s1; ++s3) {
+                      auto bf3_first = shell2bf[s3];
+                      auto n3 = obs[s3].size();
+
+                      const auto Dnorm123 = do_schwartz_screen
+                                                ? std::max(D_shblk_norm(s1, s3),
+                                                           D_shblk_norm(s2, s3))
+                                                : 0.;
+
+                      const auto s4_max = (s1 == s3) ? s2 : s3;
+                      for (const auto& s4 : obs_shellpair_list[s3]) {
+                          if (s4 > s4_max)
+                              break;  // for each s3, s4 are stored in
+                                      // monotonically increasing order
+                                      
+                          const auto Dnorm1234 =
+                              do_schwartz_screen
+                                  ? std::max(D_shblk_norm(s1, s4),
+                                             std::max(D_shblk_norm(s2, s4),
+                                                      Dnorm123))
+                                  : 0.;
+
+                          if (do_schwartz_screen &&
+                              Dnorm1234 * Q12 * Schwartz(s3, s4) < precision)
+                              continue;
+
+                          auto bf4_first = shell2bf[s4];
+                          auto n4 = obs[s4].size();
+
+                          num_k_computed += n1 * n2 * n3 * n4;
+
+                          // compute the permutational degeneracy (i.e. # of
+                          // equivalents) of the given shell set
+                          auto s12_deg = (s1 == s2) ? 1.0 : 2.0;
+                          auto s34_deg = (s3 == s4) ? 1.0 : 2.0;
+                          auto s12_34_deg =
+                              (s1 == s3) ? (s2 == s4 ? 1.0 : 2.0) : 2.0;
+                          auto s1234_deg = s12_deg * s34_deg * s12_34_deg;
+                      }
+                  }
+              }
+          }
+      }
+
+  };  // end of lambda
+
+  namespace tim = std::chrono;
+  using dur = tim::duration<double>;
+
+  auto j0 = tim::high_resolution_clock::now();
+  libint2::parallel_do(lambdaJ);
+  auto j1 = tim::high_resolution_clock::now();
+  libint2::parallel_do(lambdaK);
+  auto k1 = tim::high_resolution_clock::now();
+
+  dur jtime = j1 - j0;
+  dur ktime = k1 - j1;
+
+  std::cout << "\tJ time = " << jtime.count() << std::endl;
+  std::cout << "\tPrescreen time = " << pstime.count() << std::endl;
+  std::cout << "\tK time = " << ktime.count() << std::endl;
+  k_times.push_back(ktime.count());
+
+  // accumulate contributions from all threads
+  for(size_t i=1; i!=nthreads; ++i) {
+    G[0] += G[i];
+  }
+
+#if defined(REPORT_INTEGRAL_TIMINGS)
+  double time_for_ints = 0.0;
+  for(auto& t: timers) {
+    time_for_ints += t.read(0);
+  }
+  std::cout << "time for integrals = " << time_for_ints << std::endl;
+  for(int t=0; t!=nthreads; ++t)
+    engines[t].print_timers();
+#endif
+
+  Matrix GG = 0.5 * (G[0] + G[0].transpose());
+
+  std::cout << "\t# of coloumb integrals = " << num_j_computed << std::endl;
+  std::cout << "\t# of exchange integrals = " << num_k_computed << std::endl;
+
+  j_ints.push_back(num_j_computed);
+  k_ints.push_back(num_k_computed);
+
+  // symmetrize the result and return
+  return GG;
+}
+
 Matrix compute_2body_fock(const BasisSet& obs,
                           const Matrix& D,
                           double precision,
@@ -1384,7 +1887,6 @@ Matrix compute_2body_fock(const BasisSet& obs,
   auto insert = [](std::vector<std::vector<int>>& v, std::vector<int>& sig_v,
                    MatrixI &comp,  std::vector<int> &computed_s3s, int s3, int s4) {
       auto& s3_ket = v[s3];
-      const auto end = s3_ket.end();
       if (!comp(s3, s4)) {
           s3_ket.push_back(s4);
           comp(s3, s4) = 1;
@@ -1434,10 +1936,11 @@ Matrix compute_2body_fock(const BasisSet& obs,
 
                   const auto Q12 = Q(s1, s2);
 
-                  // sig_kets.clear();
                   clear(kets, sig_s3s);
+
                   for (auto const& nu : sig_nu_in_mus[s1]) {
                       const auto s3 = nu.first;
+
                       if(s3 > s1) continue;
                       if(Q12 * nu.second < precision){
                           break; 
@@ -1448,16 +1951,17 @@ Matrix compute_2body_fock(const BasisSet& obs,
                       const auto s4_max = (s1 == s3) ? s2 : s3;
                       for (auto const& a_pair : a_sorted_for[s3]) {
                           auto s4 = a_pair.first;
+
                           if(s4 > s1) continue;
+
                           const auto Q34 = Q(s3,s4);
                           if(Q12 * D13 * Q34 >= precision){
                               if(s4 <= s4_max){
-                                  // sig_kets.insert(std::make_pair(s3,s4));
                                   insert(kets, sig_s3s, comp, computed_s3s, s3, s4);
                               }
+
                               const auto flip_max = (s1 == s4) ? s2 : s4;
                               if(s3 <= flip_max){
-                                  // sig_kets.insert(std::make_pair(s4,s3));
                                   insert(kets, sig_s3s, comp, computed_s3s, s4, s3);
                               }
                           } else {
@@ -1466,48 +1970,49 @@ Matrix compute_2body_fock(const BasisSet& obs,
                       }
                   }
 
-                  for (auto const& nu : sig_nu_in_mus[s2]) {
-                      const auto s3 = nu.first;
-                      if(s3 > s1) continue;
-                      if(Q12 * nu.second < precision){
-                          break; 
-                      }
-
-                      const auto D23 = Ds(s2, s3);
-
-                      const auto s4_max = (s1 == s3) ? s2 : s3;
-                      for (auto const& a_pair : a_sorted_for[s3]) {
-                          auto s4 = a_pair.first;
-                          if(s4 > s1) continue;
-
-                          const auto Q34 = Q(s3,s4);
-                          if(Q12 * D23 * Q34 >= precision){
-                              if(s4 <= s4_max){
-                                  // sig_kets.insert(std::make_pair(s3,s4));
-                                  insert(kets, sig_s3s, comp, computed_s3s, s3,s4);
-                              }
-                              const auto flip_max = (s1 == s4) ? s2 : s4;
-                              if(s3 <= flip_max){
-                                  // sig_kets.insert(std::make_pair(s4,s3));
-                                  insert(kets, sig_s3s, comp, computed_s3s, s4, s3);
-                              }
-                          } else {
+                  if (s2 != s1) {
+                      for (auto const& nu : sig_nu_in_mus[s2]) {
+                          const auto s3 = nu.first;
+                          if (s3 > s1) continue;
+                          if (Q12 * nu.second < precision) {
                               break;
+                          }
+
+                          const auto D23 = Ds(s2, s3);
+
+                          const auto s4_max = (s1 == s3) ? s2 : s3;
+                          for (auto const& a_pair : a_sorted_for[s3]) {
+                              auto s4 = a_pair.first;
+
+                              if (s4 > s1) continue;
+
+                              const auto Q34 = Q(s3, s4);
+                              if (Q12 * D23 * Q34 >= precision) {
+                                  if (s4 <= s4_max) {
+                                      insert(kets, sig_s3s, comp, computed_s3s,
+                                             s3, s4);
+                                  }
+                                  const auto flip_max = (s1 == s4) ? s2 : s4;
+                                  if (s3 <= flip_max) {
+                                      insert(kets, sig_s3s, comp, computed_s3s,
+                                             s4, s3);
+                                  }
+                              } else {
+                                  break;
+                              }
                           }
                       }
                   }
 
-                  // for (auto const& sig_ket : sig_kets) {
-                  //     const auto s3 = sig_ket.first;
-                  //     const auto s4 = sig_ket.second;
-                  
+                  auto s12_deg = (s1 == s2) ? 1.0 : 2.0;
+
                   for(auto s3 : sig_s3s) {
                       computed_s3s[s3] = 0;
-                      for(auto s4 : kets[s3]){
-                          comp(s3,s4) = 0;
-
                       auto bf3_first = shell2bf[s3];
                       auto n3 = obs[s3].size();
+
+                      for(auto s4 : kets[s3]){
+                          comp(s3,s4) = 0;
 
                       auto bf4_first = shell2bf[s4];
                       auto n4 = obs[s4].size();
@@ -1517,7 +2022,6 @@ Matrix compute_2body_fock(const BasisSet& obs,
                       // compute the permutational degeneracy (i.e. # of
                       // equivalents)
                       // of the given shell set
-                      auto s12_deg = (s1 == s2) ? 1.0 : 2.0;
                       auto s34_deg = (s3 == s4) ? 1.0 : 2.0;
                       auto s12_34_deg =
                           (s1 == s3) ? (s2 == s4 ? 1.0 : 2.0) : 2.0;
