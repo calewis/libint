@@ -335,7 +335,7 @@ int main(int argc, char *argv[]) {
     /***          SCF loop           ***/
     /*** =========================== ***/
 
-    const auto maxiter = 2;
+    const auto maxiter = 20;
     const auto conv = 1e-12;
     auto iter = 0;
     auto rms_error = 1.0;
@@ -384,11 +384,7 @@ int main(int argc, char *argv[]) {
       // build a new Fock matrix
       if (not do_density_fitting) {
         const auto precision_F = fock_precision;
-        if(iter != 2){
-            F += compute_2body_fock(obs, D_diff, precision_F, K, use_linK);
-        } else {
-            F += compute_2body_fock_fake(obs, D_diff, precision_F, K, use_linK);
-        }
+        F += compute_2body_fock(obs, D_diff, precision_F, K, use_linK);
       }
 #if HAVE_DENSITY_FITTING
       else { // do DF
