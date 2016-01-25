@@ -109,7 +109,7 @@ std::vector<int> k_ints;
 shellpair_list_t
 compute_shellpair_list(const BasisSet& bs1,
                        const BasisSet& bs2 = BasisSet(),
-                       double threshold = 1e-12
+                       double threshold = std::numeric_limits<double>::epsilon()
                       );
 
 Matrix compute_2body_fock_fake(const BasisSet& obs,
@@ -120,7 +120,8 @@ Matrix compute_2body_fock_fake(const BasisSet& obs,
 
 Matrix compute_2body_fock(const BasisSet& obs,
                           const Matrix& D,
-                          double precision = std::numeric_limits<double>::epsilon(), // discard contributions smaller than this
+                          double j_precision = std::numeric_limits<double>::epsilon(), // discard contributions smaller than this
+                          double k_precision = std::numeric_limits<double>::epsilon(), // discard contributions smaller than this
                           const Matrix& Schwartz = Matrix(), // K_ij = sqrt(||(ij|ij)||_\infty); if empty, do not Schwartz screen
                           const bool use_linK = false
                          );
@@ -195,8 +196,13 @@ int main(int argc, char *argv[]) {
     // read geometry from a file; by default read from h2o.xyz, else take filename (.xyz) from the command line
     const auto filename = (argc > 1) ? argv[1] : "h2o.xyz";
     const auto basisname = (argc > 2) ? argv[2] : "aug-cc-pVDZ";
-    const auto fock_precision = (argc > 3) ? std::stod(argv[3]) : 1e-14;
-    const bool use_linK = (argc > 4) ? std::stoi(argv[4]) : false;
+    auto j_precision = (argc > 3) ? std::stod(argv[3]) : 1e-14;
+    j_precision = std::max(j_precision, std::numeric_limits<double>::epsilon());
+
+    auto k_precision = (argc > 4) ? std::stod(argv[4]) : 1e-14;
+    k_precision = std::max(k_precision, std::numeric_limits<double>::epsilon());
+
+    const bool use_linK = (argc > 5) ? std::stoi(argv[5]) : false;
 
     if(use_linK){
         std::cout << "Using LinK for exchange!" << std::endl;
@@ -344,6 +350,9 @@ int main(int argc, char *argv[]) {
     auto n2 = D.cols() * D.rows();
     libint2::DIIS<Matrix> diis(2); // start DIIS on second iteration
 
+    std::cout << "J precision = " << j_precision << std::endl;
+    std::cout << "K precision = " << k_precision << std::endl;
+
     // prepare for incremental Fock build ...
     Matrix D_diff = D;
     Matrix F = H;
@@ -383,8 +392,8 @@ int main(int argc, char *argv[]) {
 
       // build a new Fock matrix
       if (not do_density_fitting) {
-        const auto precision_F = fock_precision;
-        F += compute_2body_fock(obs, D_diff, precision_F, K, use_linK);
+        F += compute_2body_fock(obs, D_diff, j_precision, k_precision, K,
+                use_linK);
       }
 #if HAVE_DENSITY_FITTING
       else { // do DF
@@ -490,12 +499,12 @@ int main(int argc, char *argv[]) {
 
     printf("** Hartree-Fock energy = %20.12f\n", ehf + enuc);
 
-    auto sum = 0.;
+    auto ktime = 0.;
     for(auto t : k_times){
-        sum += t;
+        ktime += t;
     }
-    std::cout << "Average K time = " << sum/k_times.size() << std::endl;
-    sum = 0.;
+    std::cout << "Average K time = " << ktime/k_times.size() << std::endl;
+    auto sum = 0.;
     for(auto t : j_ints){
         sum += double(t)/double(j_ints.size());
     }
@@ -506,6 +515,31 @@ int main(int argc, char *argv[]) {
     }
     std::cout << "Average K Integrals = " << sum << std::endl;
     libint2::cleanup(); // done with libint
+
+    std::cout << "Job Summary\n";
+    std::cout << "nbasis, "
+        << "basis, "
+        << "nthreads, "
+        << "energy, "
+        << "k time, "
+        << "precision J, "
+        << "precision K, "
+        << "build type"
+        << std::endl;
+
+    std::cout << obs.nbf() << ", " 
+        << basisname << ", "
+        << libint2::nthreads << ", "
+        << ehf + enuc << ", "
+        << ktime/k_times.size() << ", "
+        << j_precision << ", "
+        << k_precision << ", ";
+    if(use_linK){
+        std::cout << "link" << std::endl;
+    } else {
+        std::cout << "n2" << std::endl;
+    }
+
 
   } // end of try block; if any exceptions occurred, report them and exit cleanly
 
@@ -858,7 +892,8 @@ Matrix compute_schwartz_ints(const BasisSet& bs1,
 
         // the diagonal elements are the Schwartz ints ... use Map.diagonal()
         Eigen::Map<const Matrix> buf_mat(buf, n12, n12);
-        auto norm2 = use_2norm ? buf_mat.diagonal().norm() : buf_mat.diagonal().lpNorm<Eigen::Infinity>();
+        auto norm2 = use_2norm ? buf_mat.diagonal().norm() 
+            : buf_mat.diagonal().lpNorm<Eigen::Infinity>();
         K(s1,s2) = std::sqrt(norm2);
         if (bs1_equiv_bs2) K(s2,s1) = K(s1,s2);
 
@@ -1614,7 +1649,8 @@ Matrix compute_2body_fock_fake(const BasisSet& obs,
 
 Matrix compute_2body_fock(const BasisSet& obs,
                           const Matrix& D,
-                          double precision,
+                          double j_precision,
+                          double k_precision,
                           const Matrix& Schwartz,
                           bool use_linK) {
 
@@ -1632,11 +1668,11 @@ Matrix compute_2body_fock(const BasisSet& obs,
   // construct the 2-electron repulsion integrals engine
   typedef libint2::TwoBodyEngine<libint2::Coulomb> coulomb_engine_type;
   std::vector<coulomb_engine_type> engines(nthreads);
+
   engines[0] = coulomb_engine_type(obs.max_nprim(), obs.max_l(), 0);
-  engines[0].set_precision(std::min(precision,std::numeric_limits<double>::epsilon())); // shellset-dependent precision control will likely break positive definiteness
+  engines[0].set_precision(std::numeric_limits<double>::epsilon()); // shellset-dependent precision control will likely break positive definiteness
                                        // stick with this simple recipe
-  std::cout << "compute_2body_fock:precision = " << precision << std::endl;
-  std::cout << "TwoBodyEngine::precision = " << engines[0].precision() << std::endl;
+                                       
   for(size_t i=1; i!=nthreads; ++i) {
     engines[i] = engines[0];
   }
@@ -1675,7 +1711,7 @@ Matrix compute_2body_fock(const BasisSet& obs,
   for(auto s1 = 0; s1 != nshells; ++s1){
       for(auto s3=0; s3 != nshells; ++s3) {
           auto d_nu_bound = Ds(s1, s3) * max_Q[s3];
-          if(max_Q[s1] * d_nu_bound >= precision){
+          if(max_Q[s1] * d_nu_bound >= k_precision){
               sig_nu_in_mus[s1].push_back(std::make_pair(s3,d_nu_bound));
           }
       }
@@ -1710,52 +1746,6 @@ Matrix compute_2body_fock(const BasisSet& obs,
 
 #endif
 
-#if 0 // Drew's significant s3 for S1 builder
-  // Vector to hold significant \nu for every \mu
-  std::vector<std::vector<int>> sig_nu_in_mus(nshells);
-  for (auto s1 = 0; s1 != nshells; ++s1) {
-      for (auto s2 : obs_shellpair_list[s1]) {
-          const auto Q12 = Q(s1, s2);
-
-          auto maxD = 0.0;
-          for (auto s3 = 0; s3 <= s1; ++s3) {
-              // Don't add s3 twice
-              auto iter = std::find(sig_nu_in_mus[s1].begin(),
-                      sig_nu_in_mus[s1].end(), s3);
-              if (iter == sig_nu_in_mus[s1].end()) {
-                  // maxD is actually the max possible val for Ds(s1,s3), Ds(s1,s4),
-                  // Ds(s2,s3), Ds(s2,s4)
-                  maxD = std::max({maxD, Ds(s1, s3), Ds(s2, s3)});
-                  const auto maxS3D = maxD * max_Q[s3];
-                  auto est = Q12 * maxS3D;
-
-                  if (est >= precision) {
-                      sig_nu_in_mus[s1].push_back(s3);
-                  }
-              }
-          }
-      }
-  }
-
-  using sorted_shell_pair_list = 
-      std::unordered_map<std::size_t, std::vector<std::pair<int, double>>>;
-
-  sorted_shell_pair_list nu_sig_sorted;
-  for (auto i = 0; i < nshells; ++i) {
-      std::vector<std::pair<int, double>> sign_sig;
-      for (auto const& j : obs_shellpair_list[i]) {
-          sign_sig.push_back(std::make_pair(j, Q(i, j)));
-      }
-      std::sort(
-          sign_sig.begin(), sign_sig.end(),
-          [](std::pair<int, double> const& a, std::pair<int, double> const b) {
-              // Sort greatest to least
-              return b.second < a.second;
-          });
-      nu_sig_sorted[i] = std::move(sign_sig);
-  }
-#endif
-
   auto prescreen1 = tim::high_resolution_clock::now();
   dur pstime = prescreen1 - prescreen0;
 
@@ -1772,13 +1762,12 @@ Matrix compute_2body_fock(const BasisSet& obs,
 
     // loop over permutationally-unique set of shells
     for(auto s1=0l, s12 = 0l; s1!=nshells; ++s1) {
-       //  if (s1 % nthreads != thread_id)
-       //    continue;
-
       auto bf1_first = shell2bf[s1]; // first basis function in this shell
       auto n1 = obs[s1].size();// number of basis functions in this shell
 
-      for(const auto& s2: obs_shellpair_list[s1]) {
+// for(const auto& s2 : obs_shellpair_list[s1]) {
+// Do J build "Exactly".
+      for(auto s2 = 0l; s2 <= s1; ++s2){
         if(s12++ % nthreads != thread_id)
             continue;
 
@@ -1794,14 +1783,16 @@ Matrix compute_2body_fock(const BasisSet& obs,
           auto n3 = obs[s3].size();
           
           const auto s4_max = (s1 == s3) ? s2 : s3;
-          for(const auto& s4: obs_shellpair_list[s3]) {
-            if (s4 > s4_max) break; // for each s3, s4 are stored in monotonically increasing order
+          // Do J build exactly
+          // for(const auto& s4: obs_shellpair_list[s3]) {
+          for(auto s4 = 0; s4 <= s4_max; ++s4){
+            // if (s4 > s4_max) break; // for each s3, s4 are stored in monotonically increasing order
 
             const auto Qest = Q12 * Q(s3,s4);
             const auto est12 = Dnorm12 * Qest;
             const auto est34 = Ds(s3,s4) * Qest;
 
-            if (do_schwartz_screen && std::max(est12, est34) < precision)
+            if (do_schwartz_screen && std::max(est12, est34) < j_precision)
               continue;
 
             auto bf4_first = shell2bf[s4];
@@ -1955,7 +1946,7 @@ Matrix compute_2body_fock(const BasisSet& obs,
                       const auto s3 = nu.first;
 
                       if(s3 > s1) continue;
-                      if(Q12 * nu.second < precision){
+                      if(Q12 * nu.second < k_precision){
                           break; 
                       }
 
@@ -1968,7 +1959,7 @@ Matrix compute_2body_fock(const BasisSet& obs,
                           if(s4 > s1) continue;
 
                           const auto Q34 = Q(s3,s4);
-                          if(Q12 * D13 * Q34 >= precision){
+                          if(Q12 * D13 * Q34 >= k_precision){
                               if(s4 <= s4_max){
                                   insert(kets, sig_s3s, comp, computed_s3s, s3, s4);
                               }
@@ -1987,7 +1978,7 @@ Matrix compute_2body_fock(const BasisSet& obs,
                       for (auto const& nu : sig_nu_in_mus[s2]) {
                           const auto s3 = nu.first;
                           if (s3 > s1) continue;
-                          if (Q12 * nu.second < precision) {
+                          if (Q12 * nu.second < k_precision) {
                               break;
                           }
 
@@ -2000,7 +1991,7 @@ Matrix compute_2body_fock(const BasisSet& obs,
                               if (s4 > s1) continue;
 
                               const auto Q34 = Q(s3, s4);
-                              if (Q12 * D23 * Q34 >= precision) {
+                              if (Q12 * D23 * Q34 >= k_precision) {
                                   if (s4 <= s4_max) {
                                       insert(kets, sig_s3s, comp, computed_s3s,
                                              s3, s4);
@@ -2136,7 +2127,7 @@ Matrix compute_2body_fock(const BasisSet& obs,
                                   : 0.;
 
                           if (do_schwartz_screen &&
-                              Dnorm1234 * Q12 * Schwartz(s3, s4) < precision)
+                              Dnorm1234 * Q12 * Schwartz(s3, s4) < k_precision)
                               continue;
 
                           auto bf4_first = shell2bf[s4];
