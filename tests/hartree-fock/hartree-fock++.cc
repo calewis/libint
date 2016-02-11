@@ -316,7 +316,8 @@ int main(int argc, char *argv[]) {
         auto F = H;
         F += compute_2body_fock_general(obs, D_minbs, minbs,
                                         true /* SOAD_D_is_shelldiagonal */,
-                                        1e-12 // this is cheap, no reason to be cheaper
+                                        0 // Do not screen primatives
+                                        // 1e-12 // this is cheap, no reason to be cheaper
                                        );
 
         // solve F C = e S C
@@ -1670,8 +1671,8 @@ Matrix compute_2body_fock(const BasisSet& obs,
   std::vector<coulomb_engine_type> engines(nthreads);
 
   engines[0] = coulomb_engine_type(obs.max_nprim(), obs.max_l(), 0);
-  engines[0].set_precision(std::numeric_limits<double>::epsilon()); // shellset-dependent precision control will likely break positive definiteness
-                                       // stick with this simple recipe
+  // engines[0].set_precision(std::numeric_limits<double>::epsilon()); 
+  engines[0].set_precision(0.); 
                                        
   for(size_t i=1; i!=nthreads; ++i) {
     engines[i] = engines[0];
